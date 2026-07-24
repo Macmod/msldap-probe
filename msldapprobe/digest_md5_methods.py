@@ -1,25 +1,40 @@
-"""SASL DIGEST-MD5 bind (RFC 2831) - plain (qop=auth) only.
+"""SASL DIGEST-MD5 bind (RFC 2831) - all three QOP levels.
 
 DIGEST-MD5 is a challenge-response SASL mechanism defined in RFC 2831
 (Historic, obsoleted by RFC 6331).  Active Directory has supported it
 since Windows Server 2003 (MS-ADTS §3.1.1.3.4.5.4) and still advertises
 it in the current specification revision.
 
-This module implements only the ``qop=auth`` flavour (no security layer):
-the client proves knowledge of the password by computing a digest
-response to the server's challenge, and no per-message wrapping is
-performed afterward.  This is the most common real-world usage of
-DIGEST-MD5 against AD - integrity (``auth-int``) and confidentiality
-(``auth-conf``) layers exist in the RFC but are rarely negotiated in
-practice, and would require a separate ``LayerStrategy`` implementation
-(HMAC-MD5 MAC and RC4/DES/3DES sealing per RFC 2831 §2.3-2.4).
+Three QOP (quality-of-protection) levels are registered:
+
+- ``sasl_digest_md5_plain``     — qop=auth     (no security layer)
+- ``sasl_digest_md5_signonly``  — qop=auth-int (integrity / HMAC-MD5 MAC)
+- ``sasl_digest_md5_signseal``  — qop=auth-conf (integrity + confidentiality via RC4)
+
+DIGEST-MD5 has no "encrypt without integrity" mode, so there is no
+``sealonly`` variant (unlike the NTLM family).
+
+The auth-int and auth-conf wire formats (RFC 2831 §2.3-2.4) place the
+MAC, a 2-byte message-type hint (0x0001), and a 4-byte big-endian
+sequence number *inside* the SASL length-prefixed frame, after the
+encoded LDAP message (or its ciphertext).  The MAC is the first 10
+bytes of ``HMAC-MD5(signing_key, seqnum ++ message)``.
+
+For auth-conf, AD offers ``3des`` and ``rc4`` ciphers; only RC4 is
+implemented here (a stream cipher, so ciphertext length equals
+plaintext length, which keeps the framing simple).
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
+import struct
+from dataclasses import dataclass
+
+from Cryptodome.Cipher import ARC4
 
 from impacket.ldap.ldapasn1 import BindRequest, ResultCode
 
@@ -63,6 +78,104 @@ def _md5(data: bytes) -> bytes:
     return hashlib.md5(data).digest()
 
 
+def _hmac_md5(key: bytes, msg: bytes) -> bytes:
+    return hmac.new(key, msg, hashlib.md5).digest()
+
+
+# ---------------------------------------------------------------------------
+# Key derivation (RFC 2831 §2.2.2)
+# ---------------------------------------------------------------------------
+
+_KIC_MAGIC = b"Digest session key to client-to-server signing key magic constant"
+_KIS_MAGIC = b"Digest session key to server-to-client signing key magic constant"
+_KCC_MAGIC = b"Digest H(A1) to client-to-server sealing key magic constant"
+_KCS_MAGIC = b"Digest H(A1) to server-to-client sealing key magic constant"
+
+
+def _derive_keys(a1_hash: bytes) -> tuple[bytes, bytes, bytes, bytes]:
+    """Derive the four per-direction keys from H(A1).
+
+    Kic/Kis are signing keys; Kcc/Kcs are sealing keys (RC4 cipher keys).
+    """
+    kic = _md5(a1_hash + _KIC_MAGIC)
+    kis = _md5(a1_hash + _KIS_MAGIC)
+    kcc = _md5(a1_hash + _KCC_MAGIC)
+    kcs = _md5(a1_hash + _KCS_MAGIC)
+    return kic, kis, kcc, kcs
+
+
+# ---------------------------------------------------------------------------
+# Layer strategies (RFC 2831 §2.3-2.4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DigestMd5IntLayerStrategy:
+    """auth-int: HMAC-MD5 integrity wrapping without encryption.
+
+    Wire format inside the 4-byte SASL length frame:
+        encoded_message || MAC(10 bytes) || 0x0001(2) || seqnum(4 BE)
+    """
+
+    name: str
+    client_sign_key: bytes  # Kic
+    server_sign_key: bytes  # Kis
+    send_seq: int = 0
+    recv_seq: int = 0
+
+    def wrap(self, plaintext: bytes) -> bytes:
+        seq = struct.pack("!I", self.send_seq)
+        mac = _hmac_md5(self.client_sign_key, seq + plaintext)[:10]
+        wrapped = plaintext + mac + b"\x00\x01" + seq
+        self.send_seq += 1
+        return wrapped
+
+    def unwrap(self, wrapped: bytes) -> bytes:
+        # Strip trailing 0x0001 (2 bytes) + seqnum (4 bytes), then MAC (10 bytes)
+        msg = wrapped[:-16]
+        self.recv_seq += 1
+        return msg
+
+
+@dataclass
+class DigestMd5ConfLayerStrategy:
+    """auth-conf: RC4 encryption + HMAC-MD5 integrity.
+
+    Wire format inside the 4-byte SASL length frame:
+        RC4(encoded_message || MAC(10 bytes)) || 0x0001(2) || seqnum(4 BE)
+
+    The MAC and seqnum are computed over the plaintext, then the
+    message+MAC is RC4-encrypted.  The 0x0001 and seqnum travel in
+    cleartext after the ciphertext.
+    """
+
+    name: str
+    client_sign_key: bytes  # Kic
+    server_sign_key: bytes  # Kis
+    client_seal_key: bytes  # Kcc
+    server_seal_key: bytes  # Kcs
+    send_seq: int = 0
+    recv_seq: int = 0
+
+    def wrap(self, plaintext: bytes) -> bytes:
+        seq = struct.pack("!I", self.send_seq)
+        mac = _hmac_md5(self.client_sign_key, seq + plaintext)[:10]
+        cipher = ARC4.new(self.client_seal_key)
+        ciphertext = cipher.encrypt(plaintext + mac)
+        wrapped = ciphertext + b"\x00\x01" + seq
+        self.send_seq += 1
+        return wrapped
+
+    def unwrap(self, wrapped: bytes) -> bytes:
+        # Strip trailing 0x0001 (2 bytes) + seqnum (4 bytes)
+        ciphertext = wrapped[:-6]
+        cipher = ARC4.new(self.server_seal_key)
+        decrypted = cipher.decrypt(ciphertext)
+        msg = decrypted[:-10]
+        self.recv_seq += 1
+        return msg
+
+
 def _build_response(
     username: str,
     realm: str,
@@ -95,6 +208,13 @@ def _build_response(
         a2 = f"{a2_prefix}{digest_uri}".encode("utf-8")
     else:
         a2 = a2_prefix.encode("utf-8")
+
+    # RFC 2831 §2.1.2: for auth-int and auth-conf, A2 includes a
+    # trailing 32-zero-hex digest (the "00000000000000000000000000000000"
+    # placeholder for the message hash that would be present in
+    # per-message integrity checks).
+    if qop in ("auth-int", "auth-conf"):
+        a2 += b":00000000000000000000000000000000"
 
     # RFC 2831 §2.1.2: response = KD(H(A1), nonce:nc:cnonce:qop:H(A2))
     # where H(A1) and H(A2) in the KD formula are the *hex* representations
@@ -141,7 +261,7 @@ def _build_response_string(
         f'digest-uri="{digest_uri}"',
         f"qop={qop}",
         f"nc={nc}",
-        f'charset="utf-8"',
+        'charset="utf-8"',
         f'response="{response}"',
     ]
     if cipher:
@@ -153,14 +273,25 @@ def _build_response_string(
 # Bind flow
 # ---------------------------------------------------------------------------
 
+# layer name -> (qop value, cipher name, needs signing flag for transport)
+_LAYER_PARAMS = {
+    "plain": ("auth", "", False),
+    "signonly": ("auth-int", "", True),
+    "signseal": ("auth-conf", "rc4", True),
+}
 
-def _bind_digest_md5_plain(transport: LDAPTransport, creds: Credentials) -> BindOutcome:
-    """Two-round SASL DIGEST-MD5 bind with qop=auth (no security layer).
+
+def _bind_digest_md5(
+    transport: LDAPTransport, creds: Credentials, layer: str
+) -> BindOutcome:
+    """Multi-round SASL DIGEST-MD5 bind supporting all three QOP levels.
 
     Round 1: empty credentials -> server returns a challenge.
-    Round 2: client response -> server returns success (or rspauth in
-    a saslBindInProgress, but AD typically completes in round 2).
+    Round 2: client response (with qop and optional cipher) -> server
+    returns success, or saslBindInProgress with rspauth for verification
+    followed by a final empty-credentials round.
     """
+    qop, cipher, _needs_signing = _LAYER_PARAMS[layer]
 
     # Round 1: initial bind with empty credentials to get the challenge.
     req = BindRequest()
@@ -172,7 +303,6 @@ def _bind_digest_md5_plain(transport: LDAPTransport, creds: Credentials) -> Bind
     code = _bind_result_code(resp)
 
     if code == ResultCode("success"):
-        # Some servers might succeed immediately (unlikely for DIGEST-MD5)
         transport.mark_bound(None)
         return BindOutcome(True, "bind succeeded (immediate, no challenge)")
 
@@ -201,10 +331,17 @@ def _bind_digest_md5_plain(transport: LDAPTransport, creds: Credentials) -> Bind
     # server."  Use the hostname (resolvable via DNS or hosts file).
     digest_uri = f"ldap/{creds.target}"
 
-    # Generate a client nonce and use nc=00000001 (first request).
+    # For auth-conf, verify the server offers a cipher we support.
+    if cipher:
+        server_ciphers = challenge.get("cipher", "")
+        if cipher not in server_ciphers.split(","):
+            return BindOutcome(
+                False,
+                f"cipher '{cipher}' not offered by server (server offers: {server_ciphers})",
+            )
+
     cnonce = os.urandom(8).hex()
     nc = "00000001"
-    qop = "auth"
 
     username = creds.username
     password = creds.password
@@ -229,6 +366,7 @@ def _bind_digest_md5_plain(transport: LDAPTransport, creds: Credentials) -> Bind
         qop=qop,
         digest_uri=digest_uri,
         response=response,
+        cipher=cipher,
     )
 
     # Round 2: send the response.
@@ -246,13 +384,12 @@ def _bind_digest_md5_plain(transport: LDAPTransport, creds: Credentials) -> Bind
         # rspauth ... and then sends an empty response").
         server_creds = resp2["bindResponse"]["serverSaslCreds"]
         if server_creds.isValue:
-            # Verify rspauth if present (best-effort)
             rspauth_data = server_creds.asOctets().decode("utf-8", errors="replace")
-            # Expected rspauth = H(A1 ":" nonce ":" nc ":" cnonce ":" qop ":" H(":"
-            #   digest_uri))
             a1_h = _md5(f"{username}:{realm}:{password}".encode("utf-8"))
             a1 = a1_h + f":{nonce}:{cnonce}".encode("utf-8")
             a2_server = f":{digest_uri}".encode("utf-8")
+            if qop in ("auth-int", "auth-conf"):
+                a2_server += b":00000000000000000000000000000000"
             expected_rspauth = _md5(
                 b":".join(
                     [
@@ -280,34 +417,56 @@ def _bind_digest_md5_plain(transport: LDAPTransport, creds: Credentials) -> Bind
         code3 = _bind_result_code(resp3)
         if code3 != ResultCode("success"):
             return BindOutcome(False, f"final ack failed: {bind_failure_detail(resp3)}")
-        transport.mark_bound(None)
-        return BindOutcome(True, "bind succeeded (qop=auth, no security layer)")
-
-    if code2 != ResultCode("success"):
+    elif code2 != ResultCode("success"):
         return BindOutcome(False, f"response failed: {bind_failure_detail(resp2)}")
 
-    transport.mark_bound(None)
-    return BindOutcome(True, "bind succeeded (qop=auth, no security layer)")
+    # Build the layer strategy (if any) and mark the transport as bound.
+    if layer == "plain":
+        strategy = None
+    else:
+        a1_h = _md5(f"{username}:{realm}:{password}".encode("utf-8"))
+        a1 = a1_h + f":{nonce}:{cnonce}".encode("utf-8")
+        a1_hash = _md5(a1)
+        kic, kis, kcc, kcs = _derive_keys(a1_hash)
+        if layer == "signonly":
+            strategy = DigestMd5IntLayerStrategy(
+                name=f"digest_md5_{layer}",
+                client_sign_key=kic,
+                server_sign_key=kis,
+            )
+        else:  # signseal
+            strategy = DigestMd5ConfLayerStrategy(
+                name=f"digest_md5_{layer}",
+                client_sign_key=kic,
+                server_sign_key=kis,
+                client_seal_key=kcc,
+                server_seal_key=kcs,
+            )
+
+    transport.mark_bound(strategy)
+    return BindOutcome(True, f"bind succeeded (qop={qop}, layer={layer})")
 
 
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
+for _layer in ("plain", "signonly", "signseal"):
 
-def _connect(creds: Credentials) -> LDAPTransport:
-    return open_transport(creds.target, creds.port, creds.scheme, signing=False)
+    def _connect(creds: Credentials, _l=_layer) -> LDAPTransport:
+        _, _, needs_signing = _LAYER_PARAMS[_l]
+        return open_transport(
+            creds.target, creds.port, creds.scheme, signing=needs_signing
+        )
 
+    def _bind(transport: LDAPTransport, creds: Credentials, _l=_layer) -> BindOutcome:
+        return _bind_digest_md5(transport, creds, _l)
 
-def _bind(transport: LDAPTransport, creds: Credentials) -> BindOutcome:
-    return _bind_digest_md5_plain(transport, creds)
-
-
-register(
-    Method(
-        "sasl_digest_md5_plain",
-        requires=["username", "password"],
-        connect=_connect,
-        bind=_bind,
+    register(
+        Method(
+            f"sasl_digest_md5_{_layer}",
+            requires=["username", "password"],
+            connect=_connect,
+            bind=_bind,
+        )
     )
-)
