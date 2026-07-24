@@ -1,0 +1,4 @@
+impacket==0.13.1
+pyasn1==0.6.3
+pyasn1_modules==0.4.2
+pycryptodomex==3.23.0
