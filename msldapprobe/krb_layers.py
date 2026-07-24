@@ -123,17 +123,28 @@ def acquire_ticket(creds, target_host: str):
         cred = ccache.getCredential(spn)
         if cred is not None:
             tgs = cred.toTGS(spn)
-            return _ticket_from_tgs_rep(tgs["KDC_REP"]), tgs["cipher"], tgs["sessionKey"]
+            return (
+                _ticket_from_tgs_rep(tgs["KDC_REP"]),
+                tgs["cipher"],
+                tgs["sessionKey"],
+            )
         # No cached service ticket - fall back to the cached TGT, if any.
-        tgt_cred = ccache.getCredential(f"krbtgt/{creds.domain.upper()}@{creds.domain.upper()}")
+        tgt_cred = ccache.getCredential(
+            f"krbtgt/{creds.domain.upper()}@{creds.domain.upper()}"
+        )
         if tgt_cred is not None:
             tgt = tgt_cred.toTGT()
             server_name = Principal(
-                f"ldap/{target_host}", type=constants.PrincipalNameType.NT_SRV_INST.value
+                f"ldap/{target_host}",
+                type=constants.PrincipalNameType.NT_SRV_INST.value,
             )
             tgs, cipher, _, session_key = getKerberosTGS(
-                server_name, creds.domain, creds.kdc_host,
-                tgt["KDC_REP"], tgt["cipher"], tgt["sessionKey"],
+                server_name,
+                creds.domain,
+                creds.kdc_host,
+                tgt["KDC_REP"],
+                tgt["cipher"],
+                tgt["sessionKey"],
             )
             return _ticket_from_tgs_rep(tgs), cipher, session_key
         raise ValueError(
