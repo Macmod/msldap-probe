@@ -16,7 +16,13 @@ from typing import Optional
 from pyasn1.codec.ber import encoder
 
 from impacket.ldap.ldap import LDAPConnection, LDAPSearchError, LDAPSessionError
-from impacket.ldap.ldapasn1 import BindRequest, ExtendedRequest, LDAPMessage, ResultCode, Scope
+from impacket.ldap.ldapasn1 import (
+    BindRequest,
+    ExtendedRequest,
+    LDAPMessage,
+    ResultCode,
+    Scope,
+)
 
 from .layers import LayerStrategy
 
@@ -53,7 +59,9 @@ class LDAPTransport(LDAPConnection):
         self.layer_strategy: Optional[LayerStrategy] = None
         self._next_message_id = 1
 
-    def upgrade_tls(self, cert_pem: Optional[str] = None, key_pem: Optional[str] = None) -> None:
+    def upgrade_tls(
+        self, cert_pem: Optional[str] = None, key_pem: Optional[str] = None
+    ) -> None:
         """Upgrades the current plaintext socket to TLS in place, with an
         optional client certificate. Used two ways: directly, for a
         ldaps:// connection with a client cert (the base class's own
@@ -74,7 +82,9 @@ class LDAPTransport(LDAPConnection):
         self._socket = conn
         self._SSL = True
 
-    def start_tls(self, cert_pem: Optional[str] = None, key_pem: Optional[str] = None) -> None:
+    def start_tls(
+        self, cert_pem: Optional[str] = None, key_pem: Optional[str] = None
+    ) -> None:
         """RFC 4511 §4.14 StartTLS extended operation over an already-open
         plaintext ldap:// connection, then upgrades the socket."""
         ext_req = ExtendedRequest()
@@ -110,13 +120,17 @@ class LDAPTransport(LDAPConnection):
 
     def encrypt(self, data: bytes) -> bytes:
         if self.layer_strategy is None:
-            raise RuntimeError("LDAPTransport.encrypt called with no active layer strategy")
+            raise RuntimeError(
+                "LDAPTransport.encrypt called with no active layer strategy"
+            )
         wrapped = self.layer_strategy.wrap(data)
         return struct.pack("!I", len(wrapped)) + wrapped
 
     def decrypt(self, data: bytes) -> bytes:
         if self.layer_strategy is None:
-            raise RuntimeError("LDAPTransport.decrypt called with no active layer strategy")
+            raise RuntimeError(
+                "LDAPTransport.decrypt called with no active layer strategy"
+            )
         # recv_raw() has already read the length-prefixed frame in full and
         # hands it over whole, prefix included - only the wrapped body
         # after those 4 bytes needs unwrapping.
@@ -161,7 +175,10 @@ class LDAPTransport(LDAPConnection):
 
         for entry in results:
             for attr in entry["attributes"]:
-                if str(attr["type"]).lower() == "namingcontexts" and len(attr["vals"]) > 0:
+                if (
+                    str(attr["type"]).lower() == "namingcontexts"
+                    and len(attr["vals"]) > 0
+                ):
                     return True, "namingContexts present"
         return False, "no namingContexts value in response"
 
@@ -207,6 +224,7 @@ def open_transport(
     starttls or ldaps - under plain ldap there's no TLS session for
     SASL EXTERNAL to derive an identity from, which is a legitimate outcome
     to observe, not something to special-case here."""
+
     # impacket's own LDAPConnection.__init__ never actually parses a port
     # out of the URL - it hardcodes _dstPort per scheme prefix (389/636)
     # and treats everything after "://" as the hostname verbatim, colon
@@ -228,7 +246,9 @@ def open_transport(
             # port (636 by default), which the getaddrinfo redirect below
             # provides since the base class won't take one via the URL.
             with _redirect_getaddrinfo_port(port or 636):
-                transport = LDAPTransport("ldap://" + target, dst_ip=dst_ip, signing=signing)
+                transport = LDAPTransport(
+                    "ldap://" + target, dst_ip=dst_ip, signing=signing
+                )
             transport.upgrade_tls(cert_pem, key_pem)
             return transport
         return LDAPTransport(_url("ldaps", 636), dst_ip=dst_ip, signing=signing)
