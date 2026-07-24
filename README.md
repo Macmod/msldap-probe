@@ -20,6 +20,7 @@ Methods are registered in `msldapprobe/methods.py` and grouped by mechanism fami
 | SASL GSSAPI carrying NTLM | `sasl_gssapi_ntlm_plain`, `sasl_gssapi_ntlm_signonly`, `sasl_gssapi_ntlm_sealonly`, `sasl_gssapi_ntlm_signseal` |
 | SASL GSS-SPNEGO wrapping Kerberos | `sasl_spnego_krb_plain`, `sasl_spnego_krb_signonly`, `sasl_spnego_krb_sealonly`, `sasl_spnego_krb_signseal` |
 | SASL GSSAPI carrying Kerberos | `sasl_gssapi_krb_plain`, `sasl_gssapi_krb_signonly`, `sasl_gssapi_krb_sealonly`, `sasl_gssapi_krb_signseal` |
+| SASL DIGEST-MD5 | `sasl_digest_md5_plain` |
 
 Each NTLM/Kerberos family tests four security layers: plain (no per-message protection), sign-only, seal-only, and sign+seal.
 

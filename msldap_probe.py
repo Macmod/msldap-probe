@@ -18,6 +18,7 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0] if "/" in __file__ else ".")
 from msldapprobe.methods import REGISTRY, Credentials  # noqa: E402
 from msldapprobe import ntlm_methods  # noqa: E402,F401 - populates REGISTRY as a side effect
 from msldapprobe import krb_methods  # noqa: E402,F401 - populates REGISTRY as a side effect
+from msldapprobe import digest_md5_methods  # noqa: E402,F401 - populates REGISTRY as a side effect
 
 
 # Same red/yellow/green/cyan-for-info convention ldapx (this repo's own Go
