@@ -95,7 +95,7 @@ python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -s 
 | `-s`, `--scheme` | Transport scheme: `ldap` (default), `starttls`, or `ldaps` |
 | `-m`, `--methods` | Comma-separated method names or prefixes, or `all` |
 | `-D`, `--debug` | Show full error details |
-| `-n`, `--no-color` | Disable colored output |
+| `-Z`, `--no-color` | Disable colored output |
 
 The `--methods` argument matches prefixes, so `sasl_gssapi_krb` selects all four `sasl_gssapi_krb_*` layers.
 

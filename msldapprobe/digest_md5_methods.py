@@ -328,8 +328,10 @@ def _bind_digest_md5(
     # AD validates this against the server's registered SPNs, so the host
     # must match a real LDAP SPN - a bare IP address will be rejected with
     # "The digest-uri does not match any LDAP SPN's registered for this
-    # server."  Use the hostname (resolvable via DNS or hosts file).
-    digest_uri = f"ldap/{creds.target}"
+    # server."  Use spn_host (defaults to target) so the probe can connect
+    # via a proxy (target=localhost:3389) while keeping the real hostname
+    # in the digest-uri for AD's SPN check.
+    digest_uri = f"ldap/{creds.spn_host}"
 
     # For auth-conf, verify the server offers a cipher we support.
     if cipher:
@@ -455,8 +457,18 @@ for _layer in ("plain", "signonly", "signseal"):
 
     def _connect(creds: Credentials, _l=_layer) -> LDAPTransport:
         _, _, needs_signing = _LAYER_PARAMS[_l]
+        # When spn_host differs from target (e.g. connecting through a
+        # proxy), pass dst_ip so impacket connects to the proxy while the
+        # URL hostname (and thus the SPN/digest-uri) stays the real host.
+        dst_ip = None
+        if creds.spn_host and creds.spn_host != creds.target:
+            dst_ip = creds.target
         return open_transport(
-            creds.target, creds.port, creds.scheme, signing=needs_signing
+            creds.spn_host or creds.target,
+            creds.port,
+            creds.scheme,
+            signing=needs_signing,
+            dst_ip=dst_ip,
         )
 
     def _bind(transport: LDAPTransport, creds: Credentials, _l=_layer) -> BindOutcome:

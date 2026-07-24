@@ -233,7 +233,16 @@ def open_transport(
             return transport
         return LDAPTransport(_url("ldaps", 636), dst_ip=dst_ip, signing=signing)
 
-    transport = LDAPTransport(_url("ldap", 389), dst_ip=dst_ip, signing=signing)
+    # When dst_ip is set and port differs from the scheme default, the
+    # base class connects to (dstIp, defaultPort) ignoring both the URL
+    # port and our actual port argument.  Redirect getaddrinfo so the
+    # socket connects to the right port.
+    _target_port = port or 389
+    if dst_ip is not None and _target_port != 389:
+        with _redirect_getaddrinfo_port(_target_port):
+            transport = LDAPTransport(_url("ldap", 389), dst_ip=dst_ip, signing=signing)
+    else:
+        transport = LDAPTransport(_url("ldap", 389), dst_ip=dst_ip, signing=signing)
     if scheme == "starttls":
         transport.start_tls(cert_pem, key_pem)
     return transport

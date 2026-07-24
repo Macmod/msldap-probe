@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         "-D", "--debug", action="store_true",
         help="Show full error details (raw pyasn1 dumps etc. can be very long) - hidden entirely otherwise",
     )
-    p.add_argument("-n", "--no-color", action="store_true", help="Disable colored output")
+    p.add_argument("-Z", "--no-color", action="store_true", help="Disable colored output")
     return p.parse_args()
 
 
