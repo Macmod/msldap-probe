@@ -20,9 +20,9 @@ Methods are registered in `msldapprobe/methods.py` and grouped by mechanism fami
 | SASL GSSAPI carrying NTLM | `sasl_gssapi_ntlm_plain`, `sasl_gssapi_ntlm_signonly`, `sasl_gssapi_ntlm_sealonly`, `sasl_gssapi_ntlm_signseal` |
 | SASL GSS-SPNEGO wrapping Kerberos | `sasl_spnego_krb_plain`, `sasl_spnego_krb_signonly`, `sasl_spnego_krb_sealonly`, `sasl_spnego_krb_signseal` |
 | SASL GSSAPI carrying Kerberos | `sasl_gssapi_krb_plain`, `sasl_gssapi_krb_signonly`, `sasl_gssapi_krb_sealonly`, `sasl_gssapi_krb_signseal` |
-| SASL DIGEST-MD5 | `sasl_digest_md5_plain` |
+| SASL DIGEST-MD5 | `sasl_digest_md5_plain`, `sasl_digest_md5_signonly`, `sasl_digest_md5_signseal` |
 
-Each NTLM/Kerberos family tests four security layers: plain (no per-message protection), sign-only, seal-only, and sign+seal.
+Each NTLM/Kerberos family tests four security layers: plain (no per-message protection), sign-only, seal-only, and sign+seal. DIGEST-MD5 has no seal-only mode (RFC 2831 auth-conf always combines integrity and confidentiality), so only plain, sign-only, and sign+seal are provided.
 
 ## Requirements
 
