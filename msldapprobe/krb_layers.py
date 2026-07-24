@@ -21,7 +21,15 @@ from pyasn1.codec.ber import decoder, encoder
 from pyasn1.type.univ import noValue
 
 from impacket.krb5 import constants
-from impacket.krb5.asn1 import AP_REP, AP_REQ, Authenticator, EncAPRepPart, TGS_REP, seq_set
+from impacket.krb5.asn1 import (
+    AP_REP,
+    AP_REQ,
+    Authenticator,
+    EncAPRepPart,
+    TGS_REP,
+    seq_set,
+)
+from impacket.krb5.ccache import CCache
 from impacket.krb5.crypto import Enctype, Key, _enctype_table, string_to_key
 from impacket.krb5.gssapi import (
     GSSAPI,
@@ -72,40 +80,94 @@ LAYER_BITMASK = {
 }
 
 
+def _ticket_from_tgs_rep(tgs_bytes: bytes):
+    """Parses a TGS_REP's encoded bytes into a Ticket."""
+    tgs_rep = decoder.decode(tgs_bytes, asn1Spec=TGS_REP())[0]
+    ticket = Ticket()
+    ticket.from_asn1(tgs_rep["ticket"])
+    return ticket
+
+
 def acquire_ticket(creds, target_host: str):
     """Returns (ticket, cipher, session_key) for the LDAP service on
-    target_host, via getKerberosTGT + getKerberosTGS - password, NT hash,
-    or AES key, whichever creds supplies.
+    target_host.
 
-    KNOWN IMPACKET QUIRK, found during investigation: getKerberosTGT's own
-    password-only path (no explicit aesKey) requests AES256 first as
-    intended, but on at least this DC that attempt gets KDC_ERR_ETYPE_NOSUPP
-    and silently falls back to RC4-HMAC - even though the account genuinely
-    supports AES (confirmed live: deriving the AES256 key ourselves with
-    the standard REALM+username salt and passing it as aesKey succeeds,
-    enctype 18). Root cause not fully isolated (possibly a salt mismatch in
-    impacket's own internal AES pre-auth attempt for the password-only
-    path), but pre-deriving the key here reliably gets AES instead of
-    RC4-HMAC whenever only a password was given - which matters, since
-    RC4-HMAC uses RFC 1964's older GSS-API token conventions rather than
-    RFC 4121's, and may be why sasl_gssapi_krb_* failed while
-    sasl_spnego_krb_* (same account, same RC4 ticket) succeeded."""
+    Credential resolution order for the Kerberos ticket:
+      1. --ccache (or KRB5CCNAME): use the cached service ticket for
+         ldap/<target_host>@REALM directly if present, otherwise use the
+         cached TGT to obtain a service ticket via getKerberosTGS. No KDC
+         AS-REQ is issued when a cached TGT is available.
+      2. --aes-key / --hashes / --password: obtain a fresh TGT in memory
+         via getKerberosTGT, then a service ticket via getKerberosTGS.
+
+    KNOWN IMPACKET QUIRK: getKerberosTGT's own password-only path (no
+    explicit aesKey) requests AES256 first as intended, but on at least
+    one DC that attempt gets KDC_ERR_ETYPE_NOSUPP and silently falls back
+    to RC4-HMAC - even though the account genuinely supports AES
+    (confirmed live: deriving the AES256 key ourselves with the standard
+    REALM+username salt and passing it as aesKey succeeds, enctype 18).
+    Root cause not fully isolated (possibly a salt mismatch in impacket's
+    own internal AES pre-auth attempt for the password-only path), but
+    pre-deriving the key here reliably gets AES instead of RC4-HMAC
+    whenever only a password was given - which matters, since RC4-HMAC
+    uses RFC 1964's older GSS-API token conventions rather than RFC
+    4121's."""
+    spn = f"ldap/{target_host}@{creds.domain.upper()}"
+
+    # Path 1: ccache (explicit --ccache, else KRB5CCNAME if set).
+    ccache_path = creds.ccache or os.getenv("KRB5CCNAME")
+    if ccache_path:
+        ccache = CCache.loadFile(ccache_path)
+        if ccache is None:
+            raise ValueError(f"could not load ccache: {ccache_path}")
+        cred = ccache.getCredential(spn)
+        if cred is not None:
+            tgs = cred.toTGS(spn)
+            return _ticket_from_tgs_rep(tgs["KDC_REP"]), tgs["cipher"], tgs["sessionKey"]
+        # No cached service ticket - fall back to the cached TGT, if any.
+        tgt_cred = ccache.getCredential(f"krbtgt/{creds.domain.upper()}@{creds.domain.upper()}")
+        if tgt_cred is not None:
+            tgt = tgt_cred.toTGT()
+            server_name = Principal(
+                f"ldap/{target_host}", type=constants.PrincipalNameType.NT_SRV_INST.value
+            )
+            tgs, cipher, _, session_key = getKerberosTGS(
+                server_name, creds.domain, creds.kdc_host,
+                tgt["KDC_REP"], tgt["cipher"], tgt["sessionKey"],
+            )
+            return _ticket_from_tgs_rep(tgs), cipher, session_key
+        raise ValueError(
+            f"ccache {ccache_path} has neither a service ticket for {spn} "
+            f"nor a TGT to obtain one"
+        )
+
+    # Path 2: obtain a fresh TGT in memory from the supplied credential.
     aes_key = creds.aes_key
     if not aes_key and not creds.nthash and creds.password:
         salt = f"{creds.domain.upper()}{creds.username}".encode()
-        aes_key = string_to_key(Enctype.AES256, creds.password.encode(), salt).contents.hex()
+        aes_key = string_to_key(
+            Enctype.AES256, creds.password.encode(), salt
+        ).contents.hex()
 
-    username = Principal(creds.username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-    tgt, cipher, _, session_key = getKerberosTGT(
-        username, creds.password, creds.domain, creds.lmhash, creds.nthash, aes_key, creds.kdc_host,
+    username = Principal(
+        creds.username, type=constants.PrincipalNameType.NT_PRINCIPAL.value
     )
-    server_name = Principal(f"ldap/{target_host}", type=constants.PrincipalNameType.NT_SRV_INST.value)
-    tgs, cipher, _, session_key = getKerberosTGS(server_name, creds.domain, creds.kdc_host, tgt, cipher, session_key)
-
-    tgs_rep = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
-    ticket = Ticket()
-    ticket.from_asn1(tgs_rep["ticket"])
-    return ticket, cipher, session_key
+    tgt, cipher, _, session_key = getKerberosTGT(
+        username,
+        creds.password,
+        creds.domain,
+        creds.lmhash,
+        creds.nthash,
+        aes_key,
+        creds.kdc_host,
+    )
+    server_name = Principal(
+        f"ldap/{target_host}", type=constants.PrincipalNameType.NT_SRV_INST.value
+    )
+    tgs, cipher, _, session_key = getKerberosTGS(
+        server_name, creds.domain, creds.kdc_host, tgt, cipher, session_key
+    )
+    return _ticket_from_tgs_rep(tgs), cipher, session_key
 
 
 def parse_gss_token(token_bytes: bytes) -> tuple[bytes, bytes]:
@@ -125,7 +187,9 @@ def decrypt_ap_rep(ap_rep_token: bytes, cipher, session_key):
     session key unchanged."""
     tok_id, ap_rep_bytes = parse_gss_token(ap_rep_token)
     if tok_id != KRB5_AP_REP:
-        raise ValueError(f"expected AP-REP token (TOK_ID {KRB5_AP_REP.hex()}), got {tok_id.hex()}")
+        raise ValueError(
+            f"expected AP-REP token (TOK_ID {KRB5_AP_REP.hex()}), got {tok_id.hex()}"
+        )
 
     ap_rep = decoder.decode(ap_rep_bytes, asn1Spec=AP_REP())[0]
     # Key Usage 12: AP-REP encrypted part, encrypted with the session key
@@ -141,7 +205,9 @@ def decrypt_ap_rep(ap_rep_token: bytes, cipher, session_key):
     return session_key
 
 
-def _rc4_unsealed_wrap_checksum(gss, key_contents: bytes, header8: bytes, confounder: bytes, data: bytes) -> bytes:
+def _rc4_unsealed_wrap_checksum(
+    gss, key_contents: bytes, header8: bytes, confounder: bytes, data: bytes
+) -> bytes:
     """Reproduces impacket.krb5.gssapi.GSSAPI_RC4's own Sgn_Cksum formula
     (RFC 4757 §7.3) for an unsealed Wrap token - confirmed by capturing a
     real DC's RFC 4752 §3.3 security-layer message live and matching this
@@ -164,12 +230,16 @@ def verify_rc4_unsealed_wrap_token(gss, key, token_bytes: bytes) -> bytes:
     etype are independent. Returns the plaintext payload with the trailing
     single-byte marker (matching GSS_Wrap_LDAP's own `data += b"\\x01"`
     convention elsewhere in impacket) stripped."""
-    wrap_struct = gss.WRAP(token_bytes[:len(gss.WRAP())])
+    wrap_struct = gss.WRAP(token_bytes[: len(gss.WRAP())])
     if wrap_struct["TOK_ID"] != 0x0102:
-        raise ValueError(f"expected RC4 Wrap token (TOK_ID 0x0102), got 0x{wrap_struct['TOK_ID']:04x}")
-    data = token_bytes[len(gss.WRAP()):]
+        raise ValueError(
+            f"expected RC4 Wrap token (TOK_ID 0x0102), got 0x{wrap_struct['TOK_ID']:04x}"
+        )
+    data = token_bytes[len(gss.WRAP()) :]
     header8 = wrap_struct.getData()[:8]
-    expected = _rc4_unsealed_wrap_checksum(gss, key.contents, header8, wrap_struct["Confounder"], data)
+    expected = _rc4_unsealed_wrap_checksum(
+        gss, key.contents, header8, wrap_struct["Confounder"], data
+    )
     if expected != wrap_struct["SGN_CKSUM"]:
         raise ValueError("security-layer-negotiation checksum mismatch")
     return data[:-1] if data.endswith(b"\x01") else data
@@ -190,6 +260,7 @@ def build_rc4_unsealed_wrap_token(gss, key, payload: bytes, seq_number: int) -> 
     token["SND_SEQ"] = struct.pack(">L", seq_number) + b"\x00" * 4  # direction='init'
 
     import os
+
     confounder = os.urandom(8)
     token["Confounder"] = confounder
 
@@ -212,7 +283,9 @@ def _cfx_checksum_header(flags: int, seq_number: int) -> bytes:
     regardless of their values in the actual token"). CFX's sequence
     number travels as a plain 8-byte big-endian value - unlike the older
     RFC 4757 RC4-HMAC format, there's no separate encryption step for it."""
-    return struct.pack(">HBBI", _WRAP_TOK_ID, flags, _WRAP_FILLER, 0) + struct.pack(">Q", seq_number)
+    return struct.pack(">HBBI", _WRAP_TOK_ID, flags, _WRAP_FILLER, 0) + struct.pack(
+        ">Q", seq_number
+    )
 
 
 def unpack_wrap_token(data: bytes) -> tuple[int, int, int, int, bytes, bytes]:
@@ -230,7 +303,9 @@ def unpack_wrap_token(data: bytes) -> tuple[int, int, int, int, bytes, bytes]:
         raise ValueError("wrap token shorter than its own header")
     tok_id, flags, filler, ec, rrc = struct.unpack(">HBBHH", data[:8])
     if tok_id != _WRAP_TOK_ID:
-        raise ValueError(f"expected Wrap token (TOK_ID 0x{_WRAP_TOK_ID:04x}), got 0x{tok_id:04x}")
+        raise ValueError(
+            f"expected Wrap token (TOK_ID 0x{_WRAP_TOK_ID:04x}), got 0x{tok_id:04x}"
+        )
     seq_number = struct.unpack(">Q", data[8:16])[0]
     body = data[16:]
     if len(body) < ec:
@@ -249,8 +324,12 @@ def build_unsealed_wrap_token(gss, key, payload: bytes, seq_number: int) -> byte
     checksum_profile = gss.checkSumProfile()
     ec = checksum_profile.macsize
     flags = 0b100
-    header = struct.pack(">HBBHH", _WRAP_TOK_ID, flags, _WRAP_FILLER, ec, 0) + struct.pack(">Q", seq_number)
-    checksum = checksum_profile.checksum(key, KG_USAGE_INITIATOR_SEAL, payload + _cfx_checksum_header(flags, seq_number))
+    header = struct.pack(
+        ">HBBHH", _WRAP_TOK_ID, flags, _WRAP_FILLER, ec, 0
+    ) + struct.pack(">Q", seq_number)
+    checksum = checksum_profile.checksum(
+        key, KG_USAGE_INITIATOR_SEAL, payload + _cfx_checksum_header(flags, seq_number)
+    )
     return header + payload + checksum
 
 
@@ -260,16 +339,40 @@ def verify_unsealed_wrap_token(gss, key, token_bytes: bytes) -> bytes:
     bitmask + max buffer size, per RFC 2222 §7.2.1)."""
     flags, ec, seq_number, rrc, checksum, payload = unpack_wrap_token(token_bytes)
     checksum_profile = gss.checkSumProfile()
-    expected = checksum_profile.checksum(key, KG_USAGE_ACCEPTOR_SEAL, payload + _cfx_checksum_header(flags, seq_number))
+    expected = checksum_profile.checksum(
+        key, KG_USAGE_ACCEPTOR_SEAL, payload + _cfx_checksum_header(flags, seq_number)
+    )
     if expected != checksum:
         raise ValueError("security-layer-negotiation checksum mismatch")
     return payload
 
 
+# Subkey etype specifications for build_ap_req's propose_subkey parameter.
+# Maps string name -> (etype_value, key_length_bytes) or None for "no subkey".
+_SUBKEY_SPECS: dict[str, tuple[int, int] | None] = {
+    "none": None,
+    "rc4-hmac": (constants.EncryptionTypes.rc4_hmac.value, 16),
+    "aes128-cts-hmac-sha1-96": (
+        constants.EncryptionTypes.aes128_cts_hmac_sha1_96.value,
+        16,
+    ),
+    "aes256-cts-hmac-sha1-96": (
+        constants.EncryptionTypes.aes256_cts_hmac_sha1_96.value,
+        32,
+    ),
+}
+
+
 def build_ap_req(
-    ticket: Ticket, cipher, session_key, creds, layer: str, channel_binding_value: bytes = b"",
-    mutual_required: bool = False, propose_subkey: bool = False, subkey_value: bytes | None = None,
-) -> tuple[bytes, bytes | None]:
+    ticket: Ticket,
+    cipher,
+    session_key,
+    creds,
+    layer: str,
+    channel_binding_value: bytes = b"",
+    mutual_required: bool = False,
+    propose_subkey: str = "aes256-cts-hmac-sha1-96",
+) -> tuple[bytes, Key | None]:
     """mutual_required must be True for bare SASL/GSSAPI (RFC 4752 §3.1:
     "the client MUST set the mutual_state flag to TRUE" - the GSSAPI SASL
     mechanism always uses mutual authentication, unlike SPNEGO's Kerberos
@@ -289,7 +392,9 @@ def build_ap_req(
     authenticator = Authenticator()
     authenticator["authenticator-vno"] = 5
     authenticator["crealm"] = creds.domain
-    username = Principal(creds.username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+    username = Principal(
+        creds.username, type=constants.PrincipalNameType.NT_PRINCIPAL.value
+    )
     seq_set(authenticator, "cname", username.components_to_asn1)
     now = datetime.datetime.now(datetime.timezone.utc)
     authenticator["cusec"] = now.microsecond
@@ -299,45 +404,47 @@ def build_ap_req(
     authenticator["cksum"]["cksumtype"] = 0x8003
     chk_field = CheckSumField()
     chk_field["Lgth"] = 16
-    chk_field["Flags"] = GSS_C_SEQUENCE_FLAG | GSS_C_REPLAY_FLAG | LAYER_CKSUM_FLAGS[layer]
+    chk_field["Flags"] = (
+        GSS_C_SEQUENCE_FLAG | GSS_C_REPLAY_FLAG | LAYER_CKSUM_FLAGS[layer]
+    )
     if channel_binding_value:
         chk_field["Bnd"] = channel_binding_value
     authenticator["cksum"]["checksum"] = chk_field.getData()
 
     # Proposing a client subkey here (RFC 4120 §5.5.1's optional
-    # Authenticator subkey field) is what determines the etype of the
-    # AP-REP's own acceptor subkey, *and* - per RFC 4121 §2 - becomes the key
-    # used for all further per-message protection whenever no AP-REP ever
-    # overrides it (SPNEGO's single-round bind here never gets one). Live
-    # testing found this DC always falls back to RC4-HMAC for the ticket's
-    # own session key regardless of the ticket's own cipher (getKerberosTGS's
-    # hardcoded etype list puts rc4_hmac first - see acquire_ticket's own
-    # doc comment for the sibling TGT-stage version of this same impacket
-    # quirk), but honors a client-proposed AES256 subkey once one is present
-    # here (confirmed by diffing against a live capture of a real
-    # ldapsearch -Y GSSAPI + Cyrus SASL/MIT krb5 bind, which always includes
-    # one). subkey_value is returned so callers building their own per-
-    # message wrap/unwrap key (sasl_spnego_krb_*, which has no AP-REP round
-    # to learn an acceptor subkey from) can use the actual proposed bytes
-    # rather than the discarded ticket session_key.
-    subkey_value = subkey_value if propose_subkey else None
-    if propose_subkey:
-        if subkey_value is None:
-            subkey_value = os.urandom(32)
+    # Authenticator subkey field) determines the etype of the AP-REP's own
+    # acceptor subkey, *and* — per RFC 4121 §2 — becomes the key used for
+    # all further per-message protection whenever no AP-REP ever overrides
+    # it (SPNEGO's single-round bind never gets one).  propose_subkey
+    # selects the etype as a string keyed into _SUBKEY_SPECS above: "none"
+    # omits the subkey entirely (DC picks from msDS-SupportedEncryptionTypes),
+    # and the named etypes request a specific cipher.  The returned Key
+    # object embeds both the etype and random key material so callers
+    # (notably the SPNEGO path) can use it directly rather than guessing
+    # the etype from the ticket cipher.
+    subkey_spec = _SUBKEY_SPECS.get(propose_subkey)
+    if subkey_spec is None:
+        subkey_key = None
+    else:
+        subkey_keytype, subkey_length = subkey_spec
+        subkey_bytes = os.urandom(subkey_length)
+        subkey_key = Key(subkey_keytype, subkey_bytes)
         authenticator["subkey"] = noValue
-        authenticator["subkey"]["keytype"] = 18  # AES256-CTS-HMAC-SHA1-96
-        authenticator["subkey"]["keyvalue"] = subkey_value
+        authenticator["subkey"]["keytype"] = subkey_keytype
+        authenticator["subkey"]["keyvalue"] = subkey_bytes
 
     authenticator["seq-number"] = 0
     encoded_authenticator = encoder.encode(authenticator)
 
     # Key Usage 11: AP-REQ Authenticator, encrypted with the application
     # session key (RFC 4120 §5.5.1).
-    encrypted_authenticator = cipher.encrypt(session_key, 11, encoded_authenticator, None)
+    encrypted_authenticator = cipher.encrypt(
+        session_key, 11, encoded_authenticator, None
+    )
     ap_req["authenticator"] = noValue
     ap_req["authenticator"]["etype"] = cipher.enctype
     ap_req["authenticator"]["cipher"] = encrypted_authenticator
-    return encoder.encode(ap_req), subkey_value
+    return encoder.encode(ap_req), subkey_key
 
 
 @dataclass
@@ -368,10 +475,14 @@ class KerberosLayerStrategy:
 
     def wrap(self, plaintext: bytes) -> bytes:
         if self.wire_seal:
-            cipher_text, token = self.gss.GSS_Wrap_LDAP(self.session_key, plaintext, self.send_seq)
+            cipher_text, token = self.gss.GSS_Wrap_LDAP(
+                self.session_key, plaintext, self.send_seq
+            )
             wrapped = token + cipher_text
         elif self.is_rc4:
-            wrapped = build_rc4_unsealed_wrap_token(self.gss, self.session_key, plaintext, self.send_seq)
+            wrapped = build_rc4_unsealed_wrap_token(
+                self.gss, self.session_key, plaintext, self.send_seq
+            )
             # Unlike round 3's negotiation reply (which is sent bare), real
             # per-message RC4-unsealed traffic is symmetrically OID-wrapped
             # in both directions - confirmed live: the DC rejected our
@@ -381,13 +492,17 @@ class KerberosLayerStrategy:
             header, data = MechIndepToken(wrapped).to_bytes()
             wrapped = header + data
         else:
-            wrapped = build_unsealed_wrap_token(self.gss, self.session_key, plaintext, self.send_seq)
+            wrapped = build_unsealed_wrap_token(
+                self.gss, self.session_key, plaintext, self.send_seq
+            )
         self.send_seq += 1
         return wrapped
 
     def unwrap(self, wrapped: bytes) -> bytes:
         if self.wire_seal:
-            plain, _ = self.gss.GSS_Unwrap_LDAP(self.session_key, wrapped, 0, direction="init")
+            plain, _ = self.gss.GSS_Unwrap_LDAP(
+                self.session_key, wrapped, 0, direction="init"
+            )
             return plain
         if self.is_rc4:
             # Real per-message RC4-unsealed traffic is [APPLICATION 0]+OID
@@ -399,7 +514,9 @@ class KerberosLayerStrategy:
         return verify_unsealed_wrap_token(self.gss, self.session_key, wrapped)
 
 
-def build_kerberos_layer_strategy(layer: str, cipher, session_key, start_seq: int = 0) -> KerberosLayerStrategy:
+def build_kerberos_layer_strategy(
+    layer: str, cipher, session_key, start_seq: int = 0
+) -> KerberosLayerStrategy:
     # Built from session_key's own etype, not the ticket cipher's - they
     # can differ (the whole reason sasl_gssapi_krb_* needed an AP-REP
     # subkey investigation): using the ticket cipher here picked the wrong

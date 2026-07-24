@@ -24,6 +24,13 @@ class Credentials:
     lmhash: str = ""
     nthash: str = ""
     aes_key: str = ""
+    # Path to a Kerberos credentials cache file. When set, Kerberos methods
+    # use the cached service ticket (or TGT) from this file instead of
+    # requesting a fresh TGT from the KDC. Overrides KRB5CCNAME. When None
+    # and no other Kerberos credential is supplied, Kerberos methods obtain
+    # a TGT in memory from whatever credential was passed (--password,
+    # --hashes, or --aes-key) via getKerberosTGT.
+    ccache: Optional[str] = None
     kdc_host: Optional[str] = None
     cert_pem: Optional[str] = None
     key_pem: Optional[str] = None
@@ -39,6 +46,13 @@ class Credentials:
     # forwarder work hit earlier). Defaults to target if not given, which
     # only works when target already is a resolvable hostname.
     spn_host: Optional[str] = None
+    # Which subkey etype to propose in the Kerberos AP-REQ Authenticator's
+    # optional subkey field (RFC 4120 §5.5.1). "none" = no subkey proposed,
+    # leaving the DC's msDS-SupportedEncryptionTypes to determine the AP-REP
+    # acceptor subkey etype (or none at all). "rc4-hmac", "aes128-cts-hmac-sha1-96",
+    # or "aes256-cts-hmac-sha1-96" (default) propose a subkey with that etype.
+    # Ignored by non-Kerberos methods.
+    propose_subkey: str = "aes256-cts-hmac-sha1-96"
 
     def __post_init__(self) -> None:
         if not self.spn_host:
@@ -49,7 +63,9 @@ class Credentials:
 class BindOutcome:
     ok: bool
     detail: str
-    layer_strategy: object = None  # LayerStrategy | None, kept loosely typed to avoid an import cycle
+    layer_strategy: object = (
+        None  # LayerStrategy | None, kept loosely typed to avoid an import cycle
+    )
 
 
 @dataclass
@@ -73,7 +89,14 @@ def register(method: Method) -> None:
 
 
 def _connect_plain(creds: Credentials) -> LDAPTransport:
-    return open_transport(creds.target, creds.port, creds.scheme, signing=False, cert_pem=creds.cert_pem, key_pem=creds.key_pem)
+    return open_transport(
+        creds.target,
+        creds.port,
+        creds.scheme,
+        signing=False,
+        cert_pem=creds.cert_pem,
+        key_pem=creds.key_pem,
+    )
 
 
 def bind_result_code(protocol_op) -> ResultCode:
@@ -112,9 +135,13 @@ def _bind_anonymous(transport: LDAPTransport, creds: Credentials) -> BindOutcome
     return _bind_simple(transport, "", "")
 
 
-def _bind_simple_authenticated(transport: LDAPTransport, creds: Credentials) -> BindOutcome:
-    name = f"{creds.username}@{creds.domain}" if "." in creds.domain else (
-        f"{creds.domain}\\{creds.username}" if creds.domain else creds.username
+def _bind_simple_authenticated(
+    transport: LDAPTransport, creds: Credentials
+) -> BindOutcome:
+    name = (
+        f"{creds.username}@{creds.domain}"
+        if "." in creds.domain
+        else (f"{creds.domain}\\{creds.username}" if creds.domain else creds.username)
     )
     return _bind_simple(transport, name, creds.password)
 
@@ -137,10 +164,21 @@ def _bind_external(transport: LDAPTransport, creds: Credentials) -> BindOutcome:
     return BindOutcome(False, bind_failure_detail(resp))
 
 
-register(Method("anonymous_bind", requires=[], connect=_connect_plain, bind=_bind_anonymous))
-register(Method("simple_bind", requires=["username", "password"], connect=_connect_plain, bind=_bind_simple_authenticated))
+register(
+    Method("anonymous_bind", requires=[], connect=_connect_plain, bind=_bind_anonymous)
+)
+register(
+    Method(
+        "simple_bind",
+        requires=["username", "password"],
+        connect=_connect_plain,
+        bind=_bind_simple_authenticated,
+    )
+)
 # No requires: --scheme controls whether there's a TLS session at all, and
 # --cert-pem/--key-pem are optional - without them this still runs and
 # shows what a target does with an EXTERNAL bind and no client identity,
 # rather than silently skipping.
-register(Method("sasl_external", requires=[], connect=_connect_plain, bind=_bind_external))
+register(
+    Method("sasl_external", requires=[], connect=_connect_plain, bind=_bind_external)
+)

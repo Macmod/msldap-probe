@@ -123,30 +123,32 @@ def _gss_initial_context_token(ap_req_bytes: bytes) -> bytes:
 
 
 def _connect(creds: Credentials, layer: str) -> LDAPTransport:
-    return open_transport(creds.target, creds.port, creds.scheme, signing=(layer != "plain"))
+    return open_transport(
+        creds.target, creds.port, creds.scheme, signing=(layer != "plain")
+    )
 
 
 # ---------------------------------------------------------------------------
 # sasl_spnego_krb_*
 # ---------------------------------------------------------------------------
 
-def _bind_spnego_krb(transport: LDAPTransport, creds: Credentials, layer: str) -> BindOutcome:
+
+def _bind_spnego_krb(
+    transport: LDAPTransport, creds: Credentials, layer: str
+) -> BindOutcome:
     try:
         ticket, cipher, session_key = acquire_ticket(creds, creds.spn_host)
     except Exception as exc:
         return BindOutcome(False, f"ticket acquisition failed: {exc}")
 
-    # Always propose an AES256 client subkey (RFC 4120 §5.5.1), same as
-    # sasl_gssapi_krb_* - this DC's TGS-REQ etype negotiation (see
-    # acquire_ticket's doc comment) routinely hands back an RC4-HMAC ticket
-    # session key even off an AES256 TGT, and RC4's GSS_Wrap uses RFC 4757's
-    # older token format rather than RFC 4121's. Since SPNEGO's single-round
-    # bind here never gets an AP-REP to potentially override it (unlike
-    # sasl_gssapi_krb_*'s round 2/3), the proposed subkey itself - not the
-    # ticket session_key - becomes the actual per-message key per RFC 4121
-    # §2, so it has to be threaded into build_kerberos_layer_strategy below
-    # instead of session_key.
-    ap_req_bytes, subkey_value = build_ap_req(ticket, cipher, session_key, creds, layer, propose_subkey=True)
+    # Proposing a client subkey (RFC 4120 §5.5.1) is the normal case: the
+    # proposed subkey itself - not the ticket session_key - becomes the
+    # actual per-message key per RFC 4121 §2 for SPNEGO's single-round
+    # bind (which never gets an AP-REP to override it, unlike GSSAPI).
+    # creds.propose_subkey selects the etype (or "none" to skip).
+    ap_req_bytes, subkey_key = build_ap_req(
+        ticket, cipher, session_key, creds, layer, propose_subkey=creds.propose_subkey
+    )
     blob = SPNEGO_NegTokenInit()
     blob["MechTypes"] = [KRB5_MECH_OID]
     blob["MechToken"] = ap_req_bytes
@@ -161,7 +163,7 @@ def _bind_spnego_krb(transport: LDAPTransport, creds: Credentials, layer: str) -
     if code != ResultCode("success"):
         return BindOutcome(False, f"authenticate failed: {bind_failure_detail(resp)}")
 
-    layer_key = Key(18, subkey_value) if subkey_value is not None else session_key
+    layer_key = subkey_key if subkey_key is not None else session_key
     strategy = build_kerberos_layer_strategy(layer, cipher, layer_key)
     active_strategy = strategy if layer != "plain" else None
     transport.mark_bound(active_strategy)
@@ -170,18 +172,23 @@ def _bind_spnego_krb(transport: LDAPTransport, creds: Credentials, layer: str) -
 
 def _register_spnego_krb() -> None:
     for layer in ("plain", "signonly", "sealonly", "signseal"):
+
         def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
             return _connect(creds, _layer)
 
-        def bind(transport: LDAPTransport, creds: Credentials, _layer=layer) -> BindOutcome:
+        def bind(
+            transport: LDAPTransport, creds: Credentials, _layer=layer
+        ) -> BindOutcome:
             return _bind_spnego_krb(transport, creds, _layer)
 
-        register(Method(
-            f"sasl_spnego_krb_{layer}",
-            requires=["username", "domain"],
-            connect=connect,
-            bind=bind,
-        ))
+        register(
+            Method(
+                f"sasl_spnego_krb_{layer}",
+                requires=["username", "domain"],
+                connect=connect,
+                bind=bind,
+            )
+        )
 
 
 _register_spnego_krb()
@@ -190,6 +197,7 @@ _register_spnego_krb()
 # ---------------------------------------------------------------------------
 # sasl_gssapi_krb_*
 # ---------------------------------------------------------------------------
+
 
 def _gssapi_bind_request(mechanism_credentials: bytes | None) -> BindRequest:
     req = BindRequest()
@@ -201,7 +209,9 @@ def _gssapi_bind_request(mechanism_credentials: bytes | None) -> BindRequest:
     return req
 
 
-def _bind_gssapi_krb(transport: LDAPTransport, creds: Credentials, layer: str) -> BindOutcome:
+def _bind_gssapi_krb(
+    transport: LDAPTransport, creds: Credentials, layer: str
+) -> BindOutcome:
     try:
         ticket, cipher, session_key = acquire_ticket(creds, creds.spn_host)
     except Exception as exc:
@@ -222,7 +232,20 @@ def _bind_gssapi_krb(transport: LDAPTransport, creds: Credentials, layer: str) -
     # reduced round-2 bitmask (0x03, no confidentiality bit) instead of the
     # full 0x07 a real client gets - this was the remaining piece of why
     # round 3 kept failing even after the AES-subkey and framing fixes.
-    ap_req_bytes, _ = build_ap_req(ticket, cipher, session_key, creds, "signseal", mutual_required=True, propose_subkey=True)
+    #
+    # Proposing a client subkey (RFC 4120 §5.5.1) steers the DC toward an
+    # acceptor subkey of that etype. Setting propose_subkey="none" lets the
+    # AP-REP subkey fall back to whatever msDS-SupportedEncryptionTypes
+    # allows, exercising GSSAPI_RC4's sealed GSS_Wrap_LDAP path.
+    ap_req_bytes, _ = build_ap_req(
+        ticket,
+        cipher,
+        session_key,
+        creds,
+        "signseal",
+        mutual_required=True,
+        propose_subkey=creds.propose_subkey,
+    )
     token = _gss_initial_context_token(ap_req_bytes)
 
     # Round 1: client's AP-REQ -> server's AP-REP (both inside RFC 2743's
@@ -240,9 +263,24 @@ def _bind_gssapi_krb(transport: LDAPTransport, creds: Credentials, layer: str) -
         return BindOutcome(False, f"authenticate failed: {bind_failure_detail(resp)}")
 
     try:
-        gss_key = decrypt_ap_rep(bytes(resp["bindResponse"]["serverSaslCreds"]), cipher, session_key)
+        gss_key = decrypt_ap_rep(
+            bytes(resp["bindResponse"]["serverSaslCreds"]), cipher, session_key
+        )
     except Exception as exc:
         return BindOutcome(False, f"AP-REP verification failed: {exc}")
+
+    # The AP-REP subkey (acceptor subkey) becomes the per-message key for
+    # ALL subsequent GSS-API calls in BOTH directions (RFC 4121 §2),
+    # regardless of whether a client subkey was proposed in the AP-REQ or
+    # the DC generated its own.  The AES/CFX path already uses this subkey
+    # for everything and works; applying the same rule to the RC4 case
+    # (propose_subkey="none") is what the DC expects
+    # for verify_rc4_unsealed_wrap_token on round 3 as well.  The SPNEGO
+    # path, which never gets an AP-REP and therefore never learns an
+    # acceptor subkey, has no such rule to apply — it simply uses whatever
+    # key it negotiated (session_key or proposed subkey), which is correct
+    # but inapplicable here.
+    round2_key = gss_key
 
     # Round 2: an empty-credentials continuation to request the server's
     # RFC 4752 §3.3 security-layer-negotiation message - it never arrives
@@ -251,16 +289,18 @@ def _bind_gssapi_krb(transport: LDAPTransport, creds: Credentials, layer: str) -
     resp2 = transport.send_bind(_gssapi_bind_request(None))
     code2 = _bind_result_code(resp2)
     if code2 != ResultCode("saslBindInProgress"):
-        return BindOutcome(False, f"security-layer negotiation failed: {bind_failure_detail(resp2)}")
+        return BindOutcome(
+            False, f"security-layer negotiation failed: {bind_failure_detail(resp2)}"
+        )
 
     # The AP-REP subkey's etype is independent of the ticket's (RFC 4120
-    # §5.5.2) - build_ap_req() now proposes an AES256 client subkey
-    # specifically to steer the DC toward an AES256 acceptor subkey (RC4
-    # was the DC's fallback when no client subkey was proposed at all -
-    # confirmed by diffing against a live ldapsearch -Y GSSAPI capture,
-    # which always includes one). gss must be built from the negotiated
-    # subkey's own etype, not the ticket cipher used for round 1, in case
-    # a DC ever ignores the proposal and falls back to RC4 anyway.
+    # §5.5.2) — build_ap_req() proposes a client subkey based on
+    # creds.propose_subkey to steer the DC toward an acceptor subkey of
+    # that etype (RC4 is the DC's fallback when no client subkey is
+    # proposed at all, confirmed by diffing against a live capture).
+    # gss must be built from the negotiated subkey's own etype, not the
+    # ticket cipher used for round 1, in case a DC ever ignores the
+    # proposal and falls back to RC4 anyway.
     gss = GSSAPI(_enctype_table[gss_key.enctype])
     is_rc4 = gss_key.enctype == EncryptionTypes.rc4_hmac.value
 
@@ -272,10 +312,14 @@ def _bind_gssapi_krb(transport: LDAPTransport, creds: Credentials, layer: str) -
     # OID) - confirmed against a live capture, where the AES-path
     # server message starts directly with the Wrap token's own TOK_ID.
     raw_server_creds = bytes(resp2["bindResponse"]["serverSaslCreds"])
-    server_wrap_bytes = MechIndepToken.from_bytes(raw_server_creds).data if is_rc4 else raw_server_creds
+    server_wrap_bytes = (
+        MechIndepToken.from_bytes(raw_server_creds).data if is_rc4 else raw_server_creds
+    )
     try:
         if is_rc4:
-            server_payload = verify_rc4_unsealed_wrap_token(gss, gss_key, server_wrap_bytes)
+            server_payload = verify_rc4_unsealed_wrap_token(
+                gss, round2_key, server_wrap_bytes
+            )
         else:
             server_payload = verify_unsealed_wrap_token(gss, gss_key, server_wrap_bytes)
     except Exception as exc:
@@ -309,15 +353,21 @@ def _bind_gssapi_krb(transport: LDAPTransport, creds: Credentials, layer: str) -
     # what finally completes the bind.
     seq_number = 0
     if is_rc4:
-        reply_token = build_rc4_unsealed_wrap_token(gss, gss_key, reply_payload, seq_number=seq_number)
+        reply_token = build_rc4_unsealed_wrap_token(
+            gss, gss_key, reply_payload, seq_number=seq_number
+        )
+        # For RC4-HMAC the DC expects ALL GSS-Wrap tokens in SASL
+        # credentials (including round 3's security-layer reply, not just
+        # the DC's own round-2 message) to be wrapped in the same
+        # [APPLICATION 0]+OID envelope — a legacy Windows quirk confirmed
+        # by KerberosLayerStrategy.wrap() doing the same wrapping for
+        # post-bind RC4-unsealed per-message traffic.
+        header, data = MechIndepToken(reply_token).to_bytes()
+        reply_token = header + data
     else:
-        reply_token = build_unsealed_wrap_token(gss, gss_key, reply_payload, seq_number=seq_number)
-    # Unlike round 2's server->client message, a real client's reply here
-    # is sent bare - no [APPLICATION 0]+OID wrapper (confirmed against a
-    # live capture: round 2's AES/CFX message from the DC is also bare,
-    # per strict RFC 2743 §3.2 - only context-establishment tokens carry
-    # the OID; the RC4 path's OID-wrapped round 2 is a separate, legacy-
-    # only Windows quirk documented on build_rc4_unsealed_wrap_token).
+        reply_token = build_unsealed_wrap_token(
+            gss, gss_key, reply_payload, seq_number=seq_number
+        )
     resp3 = transport.send_bind(_gssapi_bind_request(reply_token))
     code3 = _bind_result_code(resp3)
     if code3 != ResultCode("success"):
@@ -337,18 +387,23 @@ def _bind_gssapi_krb(transport: LDAPTransport, creds: Credentials, layer: str) -
 
 def _register_gssapi_krb() -> None:
     for layer in ("plain", "signonly", "sealonly", "signseal"):
+
         def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
             return _connect(creds, _layer)
 
-        def bind(transport: LDAPTransport, creds: Credentials, _layer=layer) -> BindOutcome:
+        def bind(
+            transport: LDAPTransport, creds: Credentials, _layer=layer
+        ) -> BindOutcome:
             return _bind_gssapi_krb(transport, creds, _layer)
 
-        register(Method(
-            f"sasl_gssapi_krb_{layer}",
-            requires=["username", "domain"],
-            connect=connect,
-            bind=bind,
-        ))
+        register(
+            Method(
+                f"sasl_gssapi_krb_{layer}",
+                requires=["username", "domain"],
+                connect=connect,
+                bind=bind,
+            )
+        )
 
 
 _register_gssapi_krb()

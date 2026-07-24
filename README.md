@@ -24,6 +24,13 @@ Methods are registered in `msldapprobe/methods.py` and grouped by mechanism fami
 
 Each NTLM/Kerberos family tests four security layers: plain (no per-message protection), sign-only, seal-only, and sign+seal. DIGEST-MD5 has no seal-only mode (RFC 2831 auth-conf always combines integrity and confidentiality), so only plain, sign-only, and sign+seal are provided.
 
+For Kerberos methods, the AP-REQ subkey etype proposal is controlled by `--propose-subkey` (see below) rather than being a separate method variant. The subkey governs per-message protection per RFC 4121 §2: `aes256-cts-hmac-sha1-96` (default) steers the DC toward an AES256 acceptor subkey; `none` lets the DC pick from its `msDS-SupportedEncryptionTypes` (typically RC4-HMAC on a default-configured DC); `rc4-hmac` and `aes128-cts-hmac-sha1-96` propose those etypes explicitly.
+
+> [!NOTE]
+> PKINIT is not implemented as it's more related to the KDC than to the LDAP service itself. To test flows related to PKINIT first perform PKINIT manually to obtain a TGT, then test Kerberos-related methods by providing it via `--ccache` or the KRB5CCNAME environment variable.
+>
+> When no Kerberos-specific credential (`--ccache`, `--aes-key`, `--keytab`) is supplied but Kerberos methods are selected and a password or NT hash is present, a TGT is obtained in memory from that credential via `getKerberosTGT` - nothing is written to disk.
+
 ## Requirements
 
 - Python 3
@@ -70,6 +77,26 @@ Run Kerberos methods with an AES key:
 python msldap_probe.py -t dc.creta.local -d creta.local -u alice -A AES256KEY -K kdc.creta.local --spn-host dc.creta.local
 ```
 
+Use a Kerberos credentials cache (e.g. after `kinit` or PKINIT):
+
+```bash
+python msldap_probe.py -t dc.creta.local -d creta.local --ccache /tmp/krb5cc_1000 -m sasl_gssapi_krb --spn-host dc.creta.local
+```
+
+When `--ccache` is set, no TGT is requested from the KDC - the cached service ticket for `ldap/<spn-host>` is used directly, or the cached TGT is used to obtain one. `KRB5CCNAME` is honored as a fallback when `--ccache` is not given.
+
+Test Kerberos with RC4 subkey fallback (DC picks the etype):
+
+```bash
+python msldap_probe.py -t dc.creta.local -d creta.local -u alice -H "LMHASH:NTHASH" -m sasl_gssapi_krb --propose-subkey none
+```
+
+Test Kerberos with an explicit RC4-HMAC subkey proposal:
+
+```bash
+python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -m sasl_spnego_krb_signseal --propose-subkey rc4-hmac
+```
+
 Use LDAPS or StartTLS:
 
 ```bash
@@ -88,8 +115,10 @@ python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -s 
 | `-p`, `--password` | Password |
 | `-H`, `--hashes` | `LM:NT` hash pair |
 | `-A`, `--aes-key` | AES key for Kerberos (AES256 or AES128) |
+| `--ccache` | Path to a Kerberos credentials cache file for Kerberos methods. Overrides `KRB5CCNAME`. When set, no TGT is requested from the KDC - the cached service ticket (or TGT, used to obtain one) is used directly |
 | `-K`, `--kdc-host` | KDC hostname/IP for Kerberos methods (defaults to `--domain`) |
 | `-S`, `--spn-host` | Real hostname for the `ldap/<host>` SPN when `--target` is an IP |
+| `--propose-subkey` | Kerberos AP-REQ subkey etype: `none` (DC picks), `rc4-hmac`, `aes128-cts-hmac-sha1-96`, or `aes256-cts-hmac-sha1-96` (default). Ignored by non-Kerberos methods |
 | `-C`, `--cert-pem` | Client certificate PEM for `sasl_external` |
 | `-k`, `--key-pem` | Client private key PEM for `sasl_external` |
 | `-s`, `--scheme` | Transport scheme: `ldap` (default), `starttls`, or `ldaps` |

@@ -58,45 +58,98 @@ _DEBUG = False
 def _truncate(detail: str, limit: int = 300) -> str:
     if _DEBUG or len(detail) <= limit:
         return detail
-    return detail[:limit] + f" ... ({len(detail) - limit} more chars, use --debug for full output)"
+    return (
+        detail[:limit]
+        + f" ... ({len(detail) - limit} more chars, use --debug for full output)"
+    )
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("-t", "--target", required=True, help="Target host or IP")
-    p.add_argument("-P", "--port", type=int, default=None, help="Override the default port for the chosen method")
-    p.add_argument("-d", "--domain", default="", help="Domain (FQDN, e.g. creta.local, or NetBIOS name)")
+    p.add_argument(
+        "-P",
+        "--port",
+        type=int,
+        default=None,
+        help="Override the default port for the chosen method",
+    )
+    p.add_argument(
+        "-d",
+        "--domain",
+        default="",
+        help="Domain (FQDN, e.g. creta.local, or NetBIOS name)",
+    )
     p.add_argument("-u", "--username", default="")
     p.add_argument("-p", "--password", default="")
     p.add_argument("-H", "--hashes", default="", help="LM:NT hash pair")
-    p.add_argument("-A", "--aes-key", default="", help="AES key for Kerberos (aes256 or aes128)")
-    p.add_argument("-K", "--kdc-host", default=None, help="KDC hostname/IP for Kerberos methods (defaults to --domain)")
     p.add_argument(
-        "-S", "--spn-host",
+        "-A", "--aes-key", default="", help="AES key for Kerberos (aes256 or aes128)"
+    )
+    p.add_argument(
+        "--ccache",
+        default=None,
+        help="Path to a Kerberos credentials cache file to use for Kerberos methods. "
+        "Overrides KRB5CCNAME. When set, no TGT is requested from the KDC - the "
+        "cached service ticket (or TGT, used to obtain one) is used directly.",
+    )
+    p.add_argument(
+        "-K",
+        "--kdc-host",
+        default=None,
+        help="KDC hostname/IP for Kerberos methods (defaults to --domain)",
+    )
+    p.add_argument(
+        "-S",
+        "--spn-host",
         default=None,
         help="LDAP service's real hostname for Kerberos SPN construction (ldap/<spn-host>) - "
         "required for the Kerberos methods when --target is a bare IP, since AD doesn't register SPNs against IPs",
     )
-    p.add_argument("-C", "--cert-pem", default=None, help="Client certificate PEM (sasl_external)")
-    p.add_argument("-k", "--key-pem", default=None, help="Client private key PEM (sasl_external)")
     p.add_argument(
-        "-s", "--scheme",
-        choices=["ldap", "starttls", "ldaps"], default="ldap",
+        "--propose-subkey",
+        default="aes256-cts-hmac-sha1-96",
+        choices=[
+            "none",
+            "rc4-hmac",
+            "aes128-cts-hmac-sha1-96",
+            "aes256-cts-hmac-sha1-96",
+        ],
+        help="Kerberos AP-REQ subkey etype proposal: 'none' (DC picks), 'rc4-hmac', "
+        "'aes128-cts-hmac-sha1-96', or 'aes256-cts-hmac-sha1-96' (default). "
+        "The subkey governs per-message protection per RFC 4121 §2. Ignored by non-Kerberos methods.",
+    )
+    p.add_argument(
+        "-C", "--cert-pem", default=None, help="Client certificate PEM (sasl_external)"
+    )
+    p.add_argument(
+        "-k", "--key-pem", default=None, help="Client private key PEM (sasl_external)"
+    )
+    p.add_argument(
+        "-s",
+        "--scheme",
+        choices=["ldap", "starttls", "ldaps"],
+        default="ldap",
         help="Transport scheme for every method's connection: ldap (default, no transport-level TLS), "
         "starttls (RFC 4511 StartTLS), or ldaps (implicit TLS)",
     )
     p.add_argument(
-        "-m", "--methods",
+        "-m",
+        "--methods",
         default="all",
         help="Comma-separated method names or prefixes, or 'all' (see methods.py REGISTRY for the full list). "
         "Each entry matches every registered method whose name starts with it, e.g. 'sasl_gssapi_krb' selects "
         "all four sasl_gssapi_krb_* layers.",
     )
     p.add_argument(
-        "-D", "--debug", action="store_true",
+        "-D",
+        "--debug",
+        action="store_true",
         help="Show full error details (raw pyasn1 dumps etc. can be very long) - hidden entirely otherwise",
     )
-    p.add_argument("-Z", "--no-color", action="store_true", help="Disable colored output")
+    p.add_argument(
+        "-Z", "--no-color", action="store_true", help="Disable colored output"
+    )
     return p.parse_args()
 
 
@@ -113,10 +166,12 @@ def build_credentials(args: argparse.Namespace) -> Credentials:
         lmhash=lmhash,
         nthash=nthash,
         aes_key=args.aes_key,
+        ccache=args.ccache,
         kdc_host=args.kdc_host or args.domain or None,
         cert_pem=args.cert_pem,
         key_pem=args.key_pem,
         spn_host=args.spn_host,
+        propose_subkey=args.propose_subkey,
         scheme=args.scheme,
     )
 
@@ -143,7 +198,9 @@ def selected_method_names(spec: str) -> list[str]:
                 seen.add(name)
                 selected.append(name)
     if unmatched:
-        raise SystemExit(f"no method matches prefix(es): {', '.join(unmatched)}\navailable: {', '.join(sorted(REGISTRY))}")
+        raise SystemExit(
+            f"no method matches prefix(es): {', '.join(unmatched)}\navailable: {', '.join(sorted(REGISTRY))}"
+        )
     return selected
 
 
