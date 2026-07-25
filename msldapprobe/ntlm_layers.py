@@ -199,9 +199,19 @@ def complete_ntlm_handshake(type1: NTLMAuthNegotiate, type2_bytes: bytes, creds,
     can use their own fresh cipher handle rather than pre-consuming
     strategy's keystream position."""
     version = type1["os_version"] if type1["flags"] & NTLMSSP_NEGOTIATE_VERSION else None
+    # impacket's NTOWFv2 checks `if hash != ''` to decide whether a hash was
+    # explicitly provided — if not, it computes the NTLM hash from the password.
+    # Our Credentials stores hashes as `bytes`, so b"" (empty, no hashes) is the
+    # default.  But in Python 3, b"" != '' is True (different types, never equal),
+    # so impacket would treat an empty-bytes nthash as "hash IS provided" and use
+    # a zero-length HMAC key, producing a garbage response that the DC rejects
+    # with data 52e (STATUS_LOGON_FAILURE).  Converting to "" when the hashes are
+    # falsy gives impacket the sentinel it expects.
+    lmhash = creds.lmhash if creds.lmhash else ""
+    nthash = creds.nthash if creds.nthash else ""
     type3, exported_session_key = getNTLMSSPType3(
         type1, type2_bytes, creds.username, creds.password, creds.domain,
-        creds.lmhash, creds.nthash, service="ldap", version=version,
+        lmhash, nthash, service="ldap", version=version,
     )
     strategy = build_ntlm_layer_strategy(layer, type3["flags"], exported_session_key, gss_wrapped=gss_wrapped)
     return type3, strategy, exported_session_key

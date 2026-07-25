@@ -156,6 +156,32 @@ def _bind_simple_authenticated(
     return _bind_simple(transport, name, creds.password)
 
 
+def _connect_external(creds: Credentials) -> LDAPTransport:
+    """SASL EXTERNAL connect: when a client cert is provided and --scheme
+    is ldaps or starttls, forces StartTLS — AD only binds the TLS client
+    cert identity to EXTERNAL when the TLS handshake happened in response
+    to StartTLS (MS-ADTS: "The presence of the 'EXTERNAL' string value in
+    the supportedSASLMechanisms attribute indicates that the DC accepts
+    external security mechanisms for LDAP bind requests… the external
+    authentication information … comes from the client certificate
+    presented by the client during the SSL/TLS handshake that occurs in
+    response to the client sending an LDAP_SERVER_START_TLS_OID extended
+    operation"), not when TLS was established implicitly via LDAPS.
+    An explicit --scheme ldap (no TLS) is left alone — it's a legitimate
+    test that shows what a server does with EXTERNAL when no TLS session
+    is available to carry an identity."""
+    if creds.cert_pem and creds.key_pem and creds.scheme != "ldap":
+        return open_transport(
+            creds.target,
+            creds.port,
+            "starttls",
+            signing=False,
+            cert_pem=creds.cert_pem,
+            key_pem=creds.key_pem,
+        )
+    return _connect_plain(creds)
+
+
 def _bind_external(transport: LDAPTransport, creds: Credentials) -> BindOutcome:
     req = BindRequest()
     req["version"] = 3
@@ -189,6 +215,13 @@ register(
 # --cert-pem/--key-pem are optional - without them this still runs and
 # shows what a target does with an EXTERNAL bind and no client identity,
 # rather than silently skipping.
+#
+# connect=_connect_external: uses StartTLS when a client cert is provided
+# and --scheme != ldap (ldaps and starttls both go through StartTLS),
+# because AD only binds the TLS client cert identity to EXTERNAL when the
+# TLS handshake happened in response to StartTLS, not under implicit LDAPS
+# TLS.  When --scheme is ldap or no cert is provided, falls through to
+# _connect_plain which honours --scheme as-is.
 register(
-    Method("sasl_external", requires=[], connect=_connect_plain, bind=_bind_external)
+    Method("sasl_external", requires=[], connect=_connect_external, bind=_bind_external)
 )
