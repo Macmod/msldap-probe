@@ -29,7 +29,7 @@ Methods are registered in `msldapprobe/methods.py` and grouped by mechanism fami
 | SASL GSSAPI carrying Kerberos | `sasl_gssapi_krb_plain`, `sasl_gssapi_krb_signonly`, `sasl_gssapi_krb_signseal` |
 | SASL DIGEST-MD5 | `sasl_digest_md5_plain`, `sasl_digest_md5_signonly`, `sasl_digest_md5_signseal` |
 
-Each NTLM family tests four security layers: plain, sign-only, seal-only, and sign+seal. Kerberos and DIGEST-MD5 have three: plain, sign-only, and sign+seal — in Kerberos/GSS-API the seal-only wire state is identical to sign+seal (GSS_Wrap with CONF already implies integrity), and DIGEST-MD5 always combines integrity and confidentiality per RFC 2831.
+Each NTLM family tests four security layers: plain, sign-only, seal-only, and sign+seal. Kerberos and DIGEST-MD5 have three: plain, sign-only, and sign+seal - in Kerberos/GSSAPI, the "seal-only" wire state is not defined (`GSS_Wrap` with CONF already implies integrity), and DIGEST-MD5 always combines integrity and confidentiality per RFC 2831.
 
 For Kerberos methods, the AP-REQ subkey etype proposal is controlled by `--propose-subkey` (see below) rather than being a separate method variant. The subkey governs per-message protection per RFC 4121 §2: `aes256-cts-hmac-sha1-96` (default) steers the DC toward an AES256 acceptor subkey; `none` lets the DC pick from its `msDS-SupportedEncryptionTypes` (typically RC4-HMAC on a default-configured DC); `rc4-hmac` and `aes128-cts-hmac-sha1-96` propose those etypes explicitly.
 
