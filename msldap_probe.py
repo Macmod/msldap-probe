@@ -165,9 +165,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_credentials(args: argparse.Namespace) -> Credentials:
-    lmhash, nthash = "", ""
+    lmhash, nthash = b"", b""
     if args.hashes:
-        lmhash, nthash = args.hashes.split(":", 1)
+        if ":" in args.hashes:
+            lmhash_str, nthash_str = args.hashes.split(":", 1)
+            lmhash = bytes.fromhex(lmhash_str) if lmhash_str else b""
+            nthash = bytes.fromhex(nthash_str) if nthash_str else b""
+        else:
+            nthash = bytes.fromhex(args.hashes)
     return Credentials(
         target=args.target,
         port=args.port,
@@ -218,9 +223,14 @@ def selected_method_names(spec: str) -> list[str]:
 
 def run_method(name: str, creds: Credentials) -> tuple[str, str]:
     method = REGISTRY[name]
-    missing = [f for f in method.requires if not getattr(creds, f)]
-    if missing:
-        return "SKIP", f"missing required field(s): {', '.join(missing)}"
+    if method.eligible is not None:
+        ok, reason = method.eligible(creds)
+        if not ok:
+            return "SKIP", reason
+    else:
+        missing = [f for f in method.requires if not getattr(creds, f)]
+        if missing:
+            return "SKIP", f"missing required field(s): {', '.join(missing)}"
 
     try:
         transport = method.connect(creds)

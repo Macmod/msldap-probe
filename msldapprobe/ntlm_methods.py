@@ -13,7 +13,14 @@ from __future__ import annotations
 
 from Cryptodome.Cipher import ARC4
 from impacket.ldap.ldapasn1 import BindRequest, ResultCode
-from impacket.ntlm import NTLMAuthChallenge, NTLMSSP_NEGOTIATE_SIGN, SEALKEY, SIGN, SIGNKEY, hmac_md5
+from impacket.ntlm import (
+    NTLMAuthChallenge,
+    NTLMSSP_NEGOTIATE_SIGN,
+    SEALKEY,
+    SIGN,
+    SIGNKEY,
+    hmac_md5,
+)
 from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
 
 from .methods import BindOutcome, Credentials, Method, bind_failure_detail, register
@@ -31,7 +38,10 @@ def _bind_result_code(protocol_op) -> ResultCode:
 # sicily_ntlm_*
 # ---------------------------------------------------------------------------
 
-def _bind_sicily(transport: LDAPTransport, creds: Credentials, layer: str) -> BindOutcome:
+
+def _bind_sicily(
+    transport: LDAPTransport, creds: Credentials, layer: str
+) -> BindOutcome:
     # Round 1: package discovery (unauthenticated probe, confirms NTLM is offered).
     discover = BindRequest()
     discover["version"] = 3
@@ -39,7 +49,9 @@ def _bind_sicily(transport: LDAPTransport, creds: Credentials, layer: str) -> Bi
     discover["authentication"]["sicilyPackageDiscovery"] = ""
     resp = transport.send_bind(discover)
     if _bind_result_code(resp) != ResultCode("success"):
-        return BindOutcome(False, f"package discovery failed: {bind_failure_detail(resp)}")
+        return BindOutcome(
+            False, f"package discovery failed: {bind_failure_detail(resp)}"
+        )
 
     # Round 2: negotiate (Type1 with layer-specific flags).
     type1 = build_type1(creds.domain, layer)
@@ -72,15 +84,36 @@ def _bind_sicily(transport: LDAPTransport, creds: Credentials, layer: str) -> Bi
     return BindOutcome(True, f"bind succeeded, layer={strategy.name}")
 
 
+def _ntlm_eligible(c: Credentials) -> tuple[bool, str]:
+    """NTLM methods accept --password or --hashes, but always need
+    --username."""
+    if c.username and (c.password or c.nthash):
+        return (True, "")
+    return (False, "need --username and one of --password/--hashes")
+
+
 def _register_sicily() -> None:
     for layer in ("plain", "signonly", "sealonly", "signseal"):
-        def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
-            return open_transport(creds.target, creds.port, creds.scheme, signing=(_layer != "plain"))
 
-        def bind(transport: LDAPTransport, creds: Credentials, _layer=layer) -> BindOutcome:
+        def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
+            return open_transport(
+                creds.target, creds.port, creds.scheme, signing=(_layer != "plain")
+            )
+
+        def bind(
+            transport: LDAPTransport, creds: Credentials, _layer=layer
+        ) -> BindOutcome:
             return _bind_sicily(transport, creds, _layer)
 
-        register(Method(f"sicily_ntlm_{layer}", requires=["username", "password"], connect=connect, bind=bind))
+        register(
+            Method(
+                f"sicily_ntlm_{layer}",
+                requires=["username", "password"],
+                connect=connect,
+                bind=bind,
+                eligible=_ntlm_eligible,
+            )
+        )
 
 
 _register_sicily()
@@ -99,7 +132,9 @@ _register_sicily()
 _NTLM_MECH_TYPE_LIST_DER = b"0\x0c\x06\n+\x06\x01\x04\x01\x827\x02\x02\n"
 
 
-def _bind_spnego_ntlm(transport: LDAPTransport, creds: Credentials, layer: str) -> BindOutcome:
+def _bind_spnego_ntlm(
+    transport: LDAPTransport, creds: Credentials, layer: str
+) -> BindOutcome:
     type1 = build_type1(creds.domain, layer, with_mic=True)
     init_blob = SPNEGO_NegTokenInit()
     init_blob["MechTypes"] = [NTLM_MECH_OID]
@@ -118,12 +153,17 @@ def _bind_spnego_ntlm(transport: LDAPTransport, creds: Credentials, layer: str) 
     resp_blob = SPNEGO_NegTokenResp(resp["bindResponse"]["serverSaslCreds"].asOctets())
     type2_bytes = resp_blob["ResponseToken"]
 
-    type3, strategy, exported_session_key = complete_ntlm_handshake(type1, type2_bytes, creds, layer, gss_wrapped=True)
+    type3, strategy, exported_session_key = complete_ntlm_handshake(
+        type1, type2_bytes, creds, layer, gss_wrapped=True
+    )
 
     # MIC over [Type1 || Type2 || Type3] binds the three messages together
     # (MS-NLMP §3.1.5.1.2) - impacket's own 'sasl' bind path always sets
     # this, so real DCs expect it.
-    mic = hmac_md5(exported_session_key, type1.getData() + NTLMAuthChallenge(type2_bytes).getData() + type3.getData())
+    mic = hmac_md5(
+        exported_session_key,
+        type1.getData() + NTLMAuthChallenge(type2_bytes).getData() + type3.getData(),
+    )
     type3["MIC"] = mic
 
     resp_blob2 = SPNEGO_NegTokenResp()
@@ -147,7 +187,9 @@ def _bind_spnego_ntlm(transport: LDAPTransport, creds: Credentials, layer: str) 
         mic_sign_key = SIGNKEY(type3["flags"], exported_session_key, mode="Client")
         mic_seal_key = SEALKEY(type3["flags"], exported_session_key, mode="Client")
         mic_handle = ARC4.new(mic_seal_key).encrypt
-        mech_list_mic = SIGN(type3["flags"], mic_sign_key, _NTLM_MECH_TYPE_LIST_DER, 0, mic_handle)
+        mech_list_mic = SIGN(
+            type3["flags"], mic_sign_key, _NTLM_MECH_TYPE_LIST_DER, 0, mic_handle
+        )
         resp_blob2["mechListMIC"] = mech_list_mic.getData()
         # impacket's own SPNEGOCipher reference reuses ONE sequence counter
         # across the mechListMIC signature (seqNum 0) and every subsequent
@@ -176,13 +218,26 @@ def _bind_spnego_ntlm(transport: LDAPTransport, creds: Credentials, layer: str) 
 
 def _register_spnego_ntlm() -> None:
     for layer in ("plain", "signonly", "sealonly", "signseal"):
-        def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
-            return open_transport(creds.target, creds.port, creds.scheme, signing=(_layer != "plain"))
 
-        def bind(transport: LDAPTransport, creds: Credentials, _layer=layer) -> BindOutcome:
+        def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
+            return open_transport(
+                creds.target, creds.port, creds.scheme, signing=(_layer != "plain")
+            )
+
+        def bind(
+            transport: LDAPTransport, creds: Credentials, _layer=layer
+        ) -> BindOutcome:
             return _bind_spnego_ntlm(transport, creds, _layer)
 
-        register(Method(f"sasl_spnego_ntlm_{layer}", requires=["username", "password"], connect=connect, bind=bind))
+        register(
+            Method(
+                f"sasl_spnego_ntlm_{layer}",
+                requires=["username", "password"],
+                connect=connect,
+                bind=bind,
+                eligible=_ntlm_eligible,
+            )
+        )
 
 
 _register_spnego_ntlm()
@@ -202,6 +257,7 @@ _register_spnego_ntlm()
 # same as sicily_ntlm_*.
 # ---------------------------------------------------------------------------
 
+
 def _extract_ntlm_message(data: bytes) -> bytes:
     """Bare NTLMSSP signature search, tolerating both a fully bare message
     and one embedded in the DC's ad-hoc wrapper - mirrors ldapx's own
@@ -212,7 +268,9 @@ def _extract_ntlm_message(data: bytes) -> bytes:
     return data[idx:]
 
 
-def _bind_gssapi_ntlm(transport: LDAPTransport, creds: Credentials, layer: str) -> BindOutcome:
+def _bind_gssapi_ntlm(
+    transport: LDAPTransport, creds: Credentials, layer: str
+) -> BindOutcome:
     type1 = build_type1(creds.domain, layer, with_mic=True)
 
     req = BindRequest()
@@ -225,10 +283,17 @@ def _bind_gssapi_ntlm(transport: LDAPTransport, creds: Credentials, layer: str) 
     if code not in (ResultCode("success"), ResultCode("saslBindInProgress")):
         return BindOutcome(False, f"negotiate failed: {bind_failure_detail(resp)}")
 
-    type2_bytes = _extract_ntlm_message(resp["bindResponse"]["serverSaslCreds"].asOctets())
+    type2_bytes = _extract_ntlm_message(
+        resp["bindResponse"]["serverSaslCreds"].asOctets()
+    )
 
-    type3, strategy, exported_session_key = complete_ntlm_handshake(type1, type2_bytes, creds, layer, gss_wrapped=True)
-    mic = hmac_md5(exported_session_key, type1.getData() + NTLMAuthChallenge(type2_bytes).getData() + type3.getData())
+    type3, strategy, exported_session_key = complete_ntlm_handshake(
+        type1, type2_bytes, creds, layer, gss_wrapped=True
+    )
+    mic = hmac_md5(
+        exported_session_key,
+        type1.getData() + NTLMAuthChallenge(type2_bytes).getData() + type3.getData(),
+    )
     type3["MIC"] = mic
 
     req2 = BindRequest()
@@ -248,13 +313,26 @@ def _bind_gssapi_ntlm(transport: LDAPTransport, creds: Credentials, layer: str) 
 
 def _register_gssapi_ntlm() -> None:
     for layer in ("plain", "signonly", "sealonly", "signseal"):
-        def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
-            return open_transport(creds.target, creds.port, creds.scheme, signing=(_layer != "plain"))
 
-        def bind(transport: LDAPTransport, creds: Credentials, _layer=layer) -> BindOutcome:
+        def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
+            return open_transport(
+                creds.target, creds.port, creds.scheme, signing=(_layer != "plain")
+            )
+
+        def bind(
+            transport: LDAPTransport, creds: Credentials, _layer=layer
+        ) -> BindOutcome:
             return _bind_gssapi_ntlm(transport, creds, _layer)
 
-        register(Method(f"sasl_gssapi_ntlm_{layer}", requires=["username", "password"], connect=connect, bind=bind))
+        register(
+            Method(
+                f"sasl_gssapi_ntlm_{layer}",
+                requires=["username", "password"],
+                connect=connect,
+                bind=bind,
+                eligible=_ntlm_eligible,
+            )
+        )
 
 
 _register_gssapi_ntlm()

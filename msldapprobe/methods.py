@@ -6,7 +6,7 @@ here; the three no-layer methods are built directly in this file.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from impacket.ldap.ldapasn1 import BindRequest, ResultCode
@@ -21,8 +21,8 @@ class Credentials:
     domain: str = ""
     username: str = ""
     password: str = ""
-    lmhash: str = ""
-    nthash: str = ""
+    lmhash: bytes = b""
+    nthash: bytes = b""
     aes_key: str = ""
     # Path to a Kerberos credentials cache file. When set, Kerberos methods
     # use the cached service ticket (or TGT) from this file instead of
@@ -84,6 +84,9 @@ class Method:
     # Performs the bind on that transport; on success calls transport.mark_bound(...)
     # and returns ok=True with whatever LayerStrategy (or None) is now active.
     bind: Callable[[LDAPTransport, Credentials], BindOutcome]
+    # Optional custom eligibility check. Overrides requires when set.
+    # Should return (True, "") if eligible, (False, "reason") if not.
+    eligible: Callable[[Credentials], tuple[bool, str]] | None = None
 
 
 REGISTRY: dict[str, Method] = {}
