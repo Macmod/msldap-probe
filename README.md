@@ -6,6 +6,11 @@ Tests every requested combination of LDAP bind mechanism and security layer agai
 
 <img width="1282" height="585" alt="image" src="https://github.com/user-attachments/assets/50f4c469-ac9c-44dd-be2d-75797188bc5b" />
 
+- **PASS**: bind succeeded and a post-bind rootDSE search returned `namingContexts`.
+- **PARTIAL**: bind succeeded, but the post-bind operation failed (a real finding, not a clean pass).
+- **FAIL**: bind or post-bind operation failed.
+- **SKIP**: method was not run because required credentials were missing.
+
 ## Purpose
 
 Use this tool to enumerate which LDAP authentication methods and signing/sealing layers a domain controller actually accepts and supports end-to-end. It is useful for checking protocol compatibility, verifying hardening, or comparing behavior across DC versions.
@@ -131,20 +136,6 @@ python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -s 
 The `--methods` argument matches prefixes, so `sasl_gssapi_krb` selects all four `sasl_gssapi_krb_*` layers.
 
 ## Output
-
-Each method prints one line:
-
-```
-PASS     sasl_gssapi_krb_signseal
-PARTIAL  sasl_spnego_ntlm_sealonly
-FAIL     sasl_gssapi_ntlm_signonly
-SKIP     sasl_external
-```
-
-- **PASS** — bind succeeded and a post-bind rootDSE search returned `namingContexts`.
-- **PARTIAL** — bind succeeded, but the post-bind operation failed (a real finding, not a clean pass).
-- **FAIL** — bind or post-bind operation failed.
-- **SKIP** — method was not run because required credentials were missing.
 
 FAIL/PARTIAL details are hidden unless `--debug` is used, to keep the default output a clean matrix.
 
