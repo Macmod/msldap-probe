@@ -4,6 +4,8 @@ LDAP/AD authentication-method matrix tester.
 
 Tests every requested combination of LDAP bind mechanism and security layer against a target, verifies each one with a real post-bind operation (a rootDSE `namingContexts` search), and reports PASS / PARTIAL / FAIL per method.
 
+<img width="1282" height="585" alt="image" src="https://github.com/user-attachments/assets/50f4c469-ac9c-44dd-be2d-75797188bc5b" />
+
 ## Purpose
 
 Use this tool to enumerate which LDAP authentication methods and signing/sealing layers a domain controller actually accepts and supports end-to-end. It is useful for checking protocol compatibility, verifying hardening, or comparing behavior across DC versions.
