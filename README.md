@@ -18,11 +18,11 @@ Methods are registered in `msldapprobe/methods.py` and grouped by mechanism fami
 | Sicily NTLM | `sicily_ntlm_plain`, `sicily_ntlm_signonly`, `sicily_ntlm_sealonly`, `sicily_ntlm_signseal` |
 | SASL GSS-SPNEGO wrapping NTLM | `sasl_spnego_ntlm_plain`, `sasl_spnego_ntlm_signonly`, `sasl_spnego_ntlm_sealonly`, `sasl_spnego_ntlm_signseal` |
 | SASL GSSAPI carrying NTLM | `sasl_gssapi_ntlm_plain`, `sasl_gssapi_ntlm_signonly`, `sasl_gssapi_ntlm_sealonly`, `sasl_gssapi_ntlm_signseal` |
-| SASL GSS-SPNEGO wrapping Kerberos | `sasl_spnego_krb_plain`, `sasl_spnego_krb_signonly`, `sasl_spnego_krb_sealonly`, `sasl_spnego_krb_signseal` |
-| SASL GSSAPI carrying Kerberos | `sasl_gssapi_krb_plain`, `sasl_gssapi_krb_signonly`, `sasl_gssapi_krb_sealonly`, `sasl_gssapi_krb_signseal` |
+| SASL GSS-SPNEGO wrapping Kerberos | `sasl_spnego_krb_plain`, `sasl_spnego_krb_signonly`, `sasl_spnego_krb_signseal` |
+| SASL GSSAPI carrying Kerberos | `sasl_gssapi_krb_plain`, `sasl_gssapi_krb_signonly`, `sasl_gssapi_krb_signseal` |
 | SASL DIGEST-MD5 | `sasl_digest_md5_plain`, `sasl_digest_md5_signonly`, `sasl_digest_md5_signseal` |
 
-Each NTLM/Kerberos family tests four security layers: plain (no per-message protection), sign-only, seal-only, and sign+seal. DIGEST-MD5 has no seal-only mode (RFC 2831 auth-conf always combines integrity and confidentiality), so only plain, sign-only, and sign+seal are provided.
+Each NTLM family tests four security layers: plain, sign-only, seal-only, and sign+seal. Kerberos and DIGEST-MD5 have three: plain, sign-only, and sign+seal — in Kerberos/GSS-API the seal-only wire state is identical to sign+seal (GSS_Wrap with CONF already implies integrity), and DIGEST-MD5 always combines integrity and confidentiality per RFC 2831.
 
 For Kerberos methods, the AP-REQ subkey etype proposal is controlled by `--propose-subkey` (see below) rather than being a separate method variant. The subkey governs per-message protection per RFC 4121 §2: `aes256-cts-hmac-sha1-96` (default) steers the DC toward an AES256 acceptor subkey; `none` lets the DC pick from its `msDS-SupportedEncryptionTypes` (typically RC4-HMAC on a default-configured DC); `rc4-hmac` and `aes128-cts-hmac-sha1-96` propose those etypes explicitly.
 
@@ -119,6 +119,7 @@ python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -s 
 | `-K`, `--kdc-host` | KDC hostname/IP for Kerberos methods (defaults to `--domain`) |
 | `-S`, `--spn-host` | Real hostname for the `ldap/<host>` SPN when `--target` is an IP |
 | `--propose-subkey` | Kerberos AP-REQ subkey etype: `none` (DC picks), `rc4-hmac`, `aes128-cts-hmac-sha1-96`, or `aes256-cts-hmac-sha1-96` (default). Ignored by non-Kerberos methods |
+| `--cksum-flags` | Override the AP-REQ GSS-API checksum flags (int bitmask of `GSS_C_INTEG_FLAG` 0x20 and `GSS_C_CONF_FLAG` 0x10, RFC 4121 §4.1.1.1). Default: 0x03 for GSSAPI, derived from the bind's layer for SPNEGO. Ignored by non-Kerberos methods |
 | `-C`, `--cert-pem` | Client certificate PEM for `sasl_external` |
 | `-k`, `--key-pem` | Client private key PEM for `sasl_external` |
 | `-s`, `--scheme` | Transport scheme: `ldap` (default), `starttls`, or `ldaps` |
@@ -126,7 +127,7 @@ python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -s 
 | `-D`, `--debug` | Show full error details |
 | `-Z`, `--no-color` | Disable colored output |
 
-The `--methods` argument matches prefixes, so `sasl_gssapi_krb` selects all four `sasl_gssapi_krb_*` layers.
+The `--methods` argument matches prefixes, so `sasl_gssapi_krb` selects all three `sasl_gssapi_krb_*` layers.
 
 ## Output
 

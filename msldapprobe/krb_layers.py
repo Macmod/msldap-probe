@@ -2,12 +2,6 @@
 control, and the post-bind GSS-API wrap/unwrap LayerStrategy shared by
 sasl_gssapi_krb_* and sasl_spnego_krb_* - per-message GSS protection is
 identical regardless of which handshake carried the AP-REQ.
-
-impacket's own kerberosLogin() (impacket/ldap/ldap.py) builds all of this
-inline with a single boolean (self.__signing) controlling both
-GSS_C_CONF_FLAG and GSS_C_INTEG_FLAG together - this module replicates its
-exact construction with an explicit 4-way layer choice instead, confirmed
-by reading kerberosLogin() directly rather than guessing at the shape.
 """
 
 from __future__ import annotations
@@ -52,30 +46,23 @@ KRB5_AP_REP = b"\x02\x00"
 _WRAP_TOK_ID = 0x0504
 _WRAP_FILLER = 0xFF
 
-# Layer -> extra Authenticator checksum flags beyond SEQUENCE|REPLAY.
-# sealonly deliberately requests confidentiality without integrity
-# (GSS_C_CONF_FLAG but not GSS_C_INTEG_FLAG) - the Kerberos/GSS-API
-# counterpart of the same edge case already tested for NTLM, worth seeing
-# how a target's AcceptSecurityContext reacts to it here too.
+# Layer name -> per-message protection flags.
+# build_kerberos_layer_strategy uses this to set wire_seal based on the
+# layer under test. --cksum-flags (int) is the mechanism for probing
+# arbitrary GSS-API checksum values not covered by a registered layer.
 LAYER_CKSUM_FLAGS = {
     "plain": 0,
     "signonly": GSS_C_INTEG_FLAG,
-    "sealonly": GSS_C_CONF_FLAG,
     "signseal": GSS_C_CONF_FLAG | GSS_C_INTEG_FLAG,
 }
 
-# RFC 2222 §7.2.1 / RFC 4752 §3.3 security-layer bitmask: unlike the
-# AP-REQ checksum flags above (which a real client always sets to the same
-# fixed Integ+Conf+Mutual regardless of the eventual per-message layer -
-# confirmed against a live gokrb5 reference client), the actual choice of
-# per-message protection is made here, in the post-auth negotiation round.
-# sealonly and signseal both select confidentiality (0x04) - GSS-API's
-# Wrap format doesn't distinguish "sealed but unsigned" from "sealed and
-# signed" as a layer selection, since sealing already implies integrity.
+# RFC 2222 §7.2.1 / RFC 4752 §3.3 security-layer bitmask: the post-auth
+# negotiation round selects per-message protection independently of the
+# AP-REQ checksum. signseal and the removed sealonly both use the same
+# confidentiality value (0x04) since GSS_Wrap with CONF implies integrity.
 LAYER_BITMASK = {
     "plain": 0x01,
     "signonly": 0x02,
-    "sealonly": 0x04,
     "signseal": 0x04,
 }
 
@@ -100,18 +87,9 @@ def acquire_ticket(creds, target_host: str):
       2. --aes-key / --hashes / --password: obtain a fresh TGT in memory
          via getKerberosTGT, then a service ticket via getKerberosTGS.
 
-    KNOWN IMPACKET QUIRK: getKerberosTGT's own password-only path (no
-    explicit aesKey) requests AES256 first as intended, but on at least
-    one DC that attempt gets KDC_ERR_ETYPE_NOSUPP and silently falls back
-    to RC4-HMAC - even though the account genuinely supports AES
-    (confirmed live: deriving the AES256 key ourselves with the standard
-    REALM+username salt and passing it as aesKey succeeds, enctype 18).
-    Root cause not fully isolated (possibly a salt mismatch in impacket's
-    own internal AES pre-auth attempt for the password-only path), but
-    pre-deriving the key here reliably gets AES instead of RC4-HMAC
-    whenever only a password was given - which matters, since RC4-HMAC
-    uses RFC 1964's older GSS-API token conventions rather than RFC
-    4121's."""
+    NOTE: when only a password is given (no --aes-key, no --hashes), the
+    AES256 key is pre-derived here with the standard REALM+username salt
+    to avoid impacket's password-only path, which may fall back to RC4-HMAC."""
     spn = f"ldap/{target_host}@{creds.domain.upper()}"
 
     # Path 1: ccache (explicit --ccache, else KRB5CCNAME if set).
@@ -219,13 +197,8 @@ def decrypt_ap_rep(ap_rep_token: bytes, cipher, session_key):
 def _rc4_unsealed_wrap_checksum(
     gss, key_contents: bytes, header8: bytes, confounder: bytes, data: bytes
 ) -> bytes:
-    """Reproduces impacket.krb5.gssapi.GSSAPI_RC4's own Sgn_Cksum formula
-    (RFC 4757 §7.3) for an unsealed Wrap token - confirmed by capturing a
-    real DC's RFC 4752 §3.3 security-layer message live and matching this
-    exact construction (sign-type 0x0d, header[:8]+Confounder+data, no
-    difference from the sealed-Wrap formula despite no encryption being
-    applied to data) against its SGN_CKSUM byte-for-byte; impacket itself
-    has no unsealed-Wrap code path to call directly."""
+    """RFC 4757 §7.3 Sgn_Cksum for an unsealed Wrap token (sign-type 0x0d,
+    computed over header[:8]+Confounder+data, same as the sealed formula)."""
     from impacket.krb5.gssapi import HMAC, MD5
 
     ksign = HMAC.new(key_contents, b"signaturekey\0", MD5).digest()
@@ -234,13 +207,10 @@ def _rc4_unsealed_wrap_checksum(
 
 
 def verify_rc4_unsealed_wrap_token(gss, key, token_bytes: bytes) -> bytes:
-    """Verifies a DC's RFC 4752 §3.3 security-layer-negotiation message
-    when the AP-REP subkey is RC4-HMAC (RFC 4757) - which is what this
-    project's test DC actually negotiates for the GSS subkey even when the
-    Kerberos ticket itself is AES256, since ticket etype and GSS subkey
-    etype are independent. Returns the plaintext payload with the trailing
-    single-byte marker (matching GSS_Wrap_LDAP's own `data += b"\\x01"`
-    convention elsewhere in impacket) stripped."""
+    """Verifies an RFC 4752 §3.3 security-layer-negotiation message wrapped
+    with an RC4-HMAC subkey (RFC 4757). Returns the plaintext payload with
+    the trailing single-byte marker (matching GSS_Wrap_LDAP's own
+    `data += b"\\x01"` convention) stripped."""
     wrap_struct = gss.WRAP(token_bytes[: len(gss.WRAP())])
     if wrap_struct["TOK_ID"] != 0x0102:
         raise ValueError(
@@ -257,11 +227,9 @@ def verify_rc4_unsealed_wrap_token(gss, key, token_bytes: bytes) -> bytes:
 
 
 def build_rc4_unsealed_wrap_token(gss, key, payload: bytes, seq_number: int) -> bytes:
-    """Builds the client's RFC 4752 §3.3 reply to match
-    verify_rc4_unsealed_wrap_token's confirmed format: RC4-HMAC Wrap token
-    (TOK_ID 0x0102), SEAL_ALG=0xffff (no confidentiality - the payload
-    travels in the clear, only integrity-protected), SND_SEQ encrypted the
-    same way impacket's own GSS_Wrap does."""
+    """Builds the client's RFC 4752 §3.3 reply: RC4-HMAC Wrap token
+    (TOK_ID 0x0102), SEAL_ALG=0xffff (no confidentiality), SND_SEQ
+    encrypted the same way impacket's GSS_Wrap does."""
     from impacket.krb5.gssapi import ARC4, HMAC, MD5
 
     data = payload + b"\x01"
@@ -288,28 +256,20 @@ def build_rc4_unsealed_wrap_token(gss, key, payload: bytes, seq_number: int) -> 
 
 def _cfx_checksum_header(flags: int, seq_number: int) -> bytes:
     """RFC 4121 §4.2.4: the checksum is computed over a 16-byte header with
-    EC and RRC fields ZEROED, regardless of their real value in the actual
-    wire token - confirmed against MIT krb5's own kg_verify_checksum_v3()
-    ("the EC and RRC fields have the value 0 for the checksum operation,
-    regardless of their values in the actual token"). CFX's sequence
-    number travels as a plain 8-byte big-endian value - unlike the older
-    RFC 4757 RC4-HMAC format, there's no separate encryption step for it."""
+    EC and RRC fields ZEROED (per MIT krb5's kg_verify_checksum_v3():
+    "the EC and RRC fields have the value 0 for the checksum operation,
+    regardless of their values in the actual token"). Sequence number
+    is a plain 8-byte big-endian value (unlike RFC 4757 RC4-HMAC)."""
     return struct.pack(">HBBI", _WRAP_TOK_ID, flags, _WRAP_FILLER, 0) + struct.pack(
         ">Q", seq_number
     )
 
 
 def unpack_wrap_token(data: bytes) -> tuple[int, int, int, int, bytes, bytes]:
-    """Parses an RFC 4121 §4.2 Wrap token used for the RFC 4752 §3.3
-    security-layer-negotiation message. The canonical (pre-rotation) body
-    is DATA followed by an EC-byte CHECKSUM; RRC (RFC 4121 §4.2.5) rotates
-    that body right by RRC bytes on the wire - confirmed against a live
-    capture of a real ldapsearch -Y GSSAPI (Cyrus SASL/MIT krb5) bind: the
-    DC's own message used RRC=EC (rotating its checksum to sit right after
-    the header), while the real client's own reply used RRC=0 (canonical,
-    unrotated) - so both ends of the same exchange use different framing
-    and this must unrotate by the token's own RRC rather than assume a
-    fixed layout."""
+    """Parses an RFC 4121 §4.2 Wrap token. The canonical body is DATA
+    followed by an EC-byte CHECKSUM; RRC (RFC 4121 §4.2.5) rotates the body
+    right by RRC bytes on the wire. This function unrotates by the token's
+    own RRC field rather than assuming a fixed layout."""
     if len(data) < 16:
         raise ValueError("wrap token shorter than its own header")
     tok_id, flags, filler, ec, rrc = struct.unpack(">HBBHH", data[:8])
@@ -327,11 +287,9 @@ def unpack_wrap_token(data: bytes) -> tuple[int, int, int, int, bytes, bytes]:
 
 
 def build_unsealed_wrap_token(gss, key, payload: bytes, seq_number: int) -> bytes:
-    """Builds the client's RFC 4752 §3.3 security-layer-negotiation reply:
-    an RFC 4121 Wrap token with the Sealed flag (bit 1) unset - integrity
-    only, no encryption. Flags 0b100 (AcceptorSubkey) and RRC=0 (canonical,
-    unrotated DATA+CHECKSUM body) both match a real client's own reply,
-    confirmed against a live ldapsearch -Y GSSAPI capture."""
+    """Builds a client RFC 4752 §3.3 reply: an RFC 4121 Wrap token with the
+    Sealed flag (bit 1) unset - integrity only, no encryption. Flags 0b100
+    (AcceptorSubkey) with RRC=0 (canonical, unrotated DATA+CHECKSUM)."""
     checksum_profile = gss.checkSumProfile()
     ec = checksum_profile.macsize
     flags = 0b100
@@ -379,20 +337,14 @@ def build_ap_req(
     cipher,
     session_key,
     creds,
-    layer: str,
+    cksum_flags: int,
     channel_binding_value: bytes = b"",
     mutual_required: bool = False,
     propose_subkey: str = "aes256-cts-hmac-sha1-96",
 ) -> tuple[bytes, Key | None]:
     """mutual_required must be True for bare SASL/GSSAPI (RFC 4752 §3.1:
-    "the client MUST set the mutual_state flag to TRUE" - the GSSAPI SASL
-    mechanism always uses mutual authentication, unlike SPNEGO's Kerberos
-    negotiation, where impacket's own reference kerberosLogin() leaves
-    ap-options empty and works fine). Omitting this produced a uniform
-    resultCode=unavailable rejection across all four sasl_gssapi_krb_*
-    layers - the server refusing the whole exchange as inconsistent with
-    what the mechanism itself requires, not a credentials or framing
-    problem."""
+    "the client MUST set the mutual_state flag to TRUE") - the GSSAPI SASL
+    mechanism always uses mutual authentication, unlike SPNEGO's Kerberos."""
     ap_req = AP_REQ()
     ap_req["pvno"] = 5
     ap_req["msg-type"] = int(constants.ApplicationTagNumbers.AP_REQ.value)
@@ -416,7 +368,7 @@ def build_ap_req(
     chk_field = CheckSumField()
     chk_field["Lgth"] = 16
     chk_field["Flags"] = (
-        GSS_C_SEQUENCE_FLAG | GSS_C_REPLAY_FLAG | LAYER_CKSUM_FLAGS[layer]
+        GSS_C_SEQUENCE_FLAG | GSS_C_REPLAY_FLAG | cksum_flags
     )
     if channel_binding_value:
         chk_field["Bnd"] = channel_binding_value
@@ -462,20 +414,11 @@ def build_ap_req(
 class KerberosLayerStrategy:
     """wire_seal chooses GSS_Wrap_LDAP (confidentiality) vs an unsealed
     RFC 4121 Wrap token (sign-only, no encryption) at actual message-wrap
-    time - independent of what was negotiated in the AP-REQ checksum, same
-    as impacket's own GSSAPI_* classes expose both primitives without
-    tying either to the other.
+    time - independent of what was negotiated in the AP-REQ checksum.
 
-    Sign-only uses the SAME unsealed-Wrap-token format as round 3 of
-    sasl_gssapi_krb_*'s security-layer negotiation (build_unsealed_wrap_
-    token/verify_unsealed_wrap_token, or their RC4 counterparts) - NOT a
-    separate MIC/GetMIC token, which was this class's original (wrong)
-    assumption. Confirmed against a live capture of a real
-    ldapsearch -Y GSSAPI bind forced to integrity-only
-    (-O minssf=1,maxssf=1): its post-bind messages used TOK_ID 0x0504
-    (Wrap) with Flags=0x04 (AcceptorSubkey, no Sealed bit) - a plain
-    unsealed Wrap token carrying the whole LDAP message as its payload,
-    exactly like round 3's 4-byte payload, just larger."""
+    Sign-only uses the same unsealed-Wrap-token format (TOK_ID 0x0504,
+    Flags=0x04, no Sealed bit) as round 3's security-layer negotiation,
+    NOT a separate MIC/GetMIC token."""
 
     name: str
     gss: object  # GSSAPI_RC4 | GSSAPI_AES, from impacket.krb5.gssapi's GSSAPI(cipher) factory
@@ -494,12 +437,8 @@ class KerberosLayerStrategy:
             wrapped = build_rc4_unsealed_wrap_token(
                 self.gss, self.session_key, plaintext, self.send_seq
             )
-            # Unlike round 3's negotiation reply (which is sent bare), real
-            # per-message RC4-unsealed traffic is symmetrically OID-wrapped
-            # in both directions - confirmed live: the DC rejected our
-            # bare attempt (silently, as its own "couldn't decrypt"
-            # response, itself only readable once unwrap()'s matching fix
-            # below was in place) and accepted the OID-wrapped one.
+            # Per-message RC4-unsealed traffic is OID-wrapped in both
+            # directions (unlike round 3's bare negotiation reply).
             header, data = MechIndepToken(wrapped).to_bytes()
             wrapped = header + data
         else:
@@ -516,9 +455,7 @@ class KerberosLayerStrategy:
             )
             return plain
         if self.is_rc4:
-            # Real per-message RC4-unsealed traffic is [APPLICATION 0]+OID
-            # wrapped, same legacy Windows quirk already found for round
-            # 2's security-layer-negotiation message.
+            # Per-message RC4-unsealed traffic is [APPLICATION 0]+OID wrapped.
             if wrapped[:1] == b"\x60":
                 wrapped = MechIndepToken.from_bytes(wrapped).data
             return verify_rc4_unsealed_wrap_token(self.gss, self.session_key, wrapped)
@@ -529,13 +466,9 @@ def build_kerberos_layer_strategy(
     layer: str, cipher, session_key, start_seq: int = 0
 ) -> KerberosLayerStrategy:
     # Built from session_key's own etype, not the ticket cipher's - they
-    # can differ (the whole reason sasl_gssapi_krb_* needed an AP-REP
-    # subkey investigation): using the ticket cipher here picked the wrong
-    # GSSAPI_* class whenever the negotiated subkey's etype didn't match
-    # the ticket's, silently routing AES-keyed data through RC4's
-    # GSS_Wrap_LDAP/GSS_Unwrap_LDAP (which expects an OID-wrapped envelope
-    # neither side ever sends for real per-message traffic) instead of
-    # AES's (which doesn't).
+    # can differ (e.g. the AP-REP acceptor subkey may have a different
+    # etype than the ticket). Using the ticket cipher here would select
+    # the wrong GSSAPI_* class.
     gss = GSSAPI(_enctype_table[session_key.enctype])
     return KerberosLayerStrategy(
         name=f"krb_{layer}",

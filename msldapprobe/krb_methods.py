@@ -81,20 +81,21 @@ after a multi-stage investigation. In order:
    counter from where round 3 left it (1, since round 3 used 0) rather
    than restart at 0.
 
-All four sasl_gssapi_krb_* layers now PASS end-to-end, verified against
+All three sasl_gssapi_krb_* layers now PASS end-to-end, verified against
 the CRETA.LOCAL test DC.
 """
 
 from __future__ import annotations
 
 from impacket.krb5.constants import EncryptionTypes
-from impacket.krb5.crypto import Key, _enctype_table
+from impacket.krb5.crypto import _enctype_table
 from impacket.krb5.gssapi import GSSAPI, KRB5_AP_REQ, MechIndepToken
 from impacket.ldap.ldapasn1 import BindRequest, ResultCode
 from impacket.spnego import SPNEGO_NegTokenInit, TypesMech
 
 from .krb_layers import (
     LAYER_BITMASK,
+    LAYER_CKSUM_FLAGS,
     acquire_ticket,
     build_ap_req,
     build_kerberos_layer_strategy,
@@ -146,8 +147,18 @@ def _bind_spnego_krb(
     # actual per-message key per RFC 4121 §2 for SPNEGO's single-round
     # bind (which never gets an AP-REP to override it, unlike GSSAPI).
     # creds.propose_subkey selects the etype (or "none" to skip).
+    # creds.cksum_flags overrides the AP-REQ checksum flags (int); defaults to the
+    # bind's own layer (SPNEGO has no §3.3 round, so the checksum IS the choice).
+    ck_flags = (
+        creds.cksum_flags if creds.cksum_flags is not None else LAYER_CKSUM_FLAGS[layer]
+    )
     ap_req_bytes, subkey_key = build_ap_req(
-        ticket, cipher, session_key, creds, layer, propose_subkey=creds.propose_subkey
+        ticket,
+        cipher,
+        session_key,
+        creds,
+        ck_flags,
+        propose_subkey=creds.propose_subkey,
     )
     blob = SPNEGO_NegTokenInit()
     blob["MechTypes"] = [KRB5_MECH_OID]
@@ -171,7 +182,7 @@ def _bind_spnego_krb(
 
 
 def _register_spnego_krb() -> None:
-    for layer in ("plain", "signonly", "sealonly", "signseal"):
+    for layer in ("plain", "signonly", "signseal"):
 
         def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
             return _connect(creds, _layer)
@@ -237,12 +248,21 @@ def _bind_gssapi_krb(
     # acceptor subkey of that etype. Setting propose_subkey="none" lets the
     # AP-REP subkey fall back to whatever msDS-SupportedEncryptionTypes
     # allows, exercising GSSAPI_RC4's sealed GSS_Wrap_LDAP path.
+    #
+    # The AP-REQ checksum flags default to signseal (0x03, the max, as a real
+    # client always sends during init - the actual layer is chosen in the
+    # §3.3 round below). creds.cksum_flags (int) overrides this.
+    ck_flags = (
+        creds.cksum_flags
+        if creds.cksum_flags is not None
+        else LAYER_CKSUM_FLAGS["signseal"]
+    )
     ap_req_bytes, _ = build_ap_req(
         ticket,
         cipher,
         session_key,
         creds,
-        "signseal",
+        ck_flags,
         mutual_required=True,
         propose_subkey=creds.propose_subkey,
     )
@@ -386,7 +406,7 @@ def _bind_gssapi_krb(
 
 
 def _register_gssapi_krb() -> None:
-    for layer in ("plain", "signonly", "sealonly", "signseal"):
+    for layer in ("plain", "signonly", "signseal"):
 
         def connect(creds: Credentials, _layer=layer) -> LDAPTransport:
             return _connect(creds, _layer)

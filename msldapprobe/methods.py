@@ -53,6 +53,13 @@ class Credentials:
     # or "aes256-cts-hmac-sha1-96" (default) propose a subkey with that etype.
     # Ignored by non-Kerberos methods.
     propose_subkey: str = "aes256-cts-hmac-sha1-96"
+    # Override the AP-REQ GSS-API checksum flags (int bitmask) for Kerberos
+    # methods. Combines GSS_C_INTEG_FLAG (0x20) and GSS_C_CONF_FLAG (0x10)
+    # per RFC 4121 \u00a74.1.1.1. When set, uses these flags directly for the
+    # AP-REQ Authenticator checksum instead of each method family's default
+    # (GSSAPI: 0x03, SPNEGO: derived from the bind's own layer). Ignored by
+    # non-Kerberos methods.
+    cksum_flags: int | None = None
 
     def __post_init__(self) -> None:
         if not self.spn_host:

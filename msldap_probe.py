@@ -120,6 +120,17 @@ def parse_args() -> argparse.Namespace:
         "The subkey governs per-message protection per RFC 4121 §2. Ignored by non-Kerberos methods.",
     )
     p.add_argument(
+        "--cksum-flags",
+        default=None,
+        type=int,
+        help="Override the AP-REQ GSS-API checksum flags (int) for Kerberos methods. "
+        "Bitmask of GSS_C_INTEG_FLAG (0x20) and GSS_C_CONF_FLAG (0x10) "
+        "per RFC 4121 §4.1.1.1 combined with the mandatory GSS_C_SEQUENCE_FLAG "
+        "and GSS_C_REPLAY_FLAG. When set, Kerberos methods use these bits "
+        "instead of the default (GSSAPI: 0x03, SPNEGO: derived from the "
+        "bind's own layer). Ignored by non-Kerberos methods.",
+    )
+    p.add_argument(
         "-C", "--cert-pem", default=None, help="Client certificate PEM (sasl_external)"
     )
     p.add_argument(
@@ -139,7 +150,7 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help="Comma-separated method names or prefixes, or 'all' (see methods.py REGISTRY for the full list). "
         "Each entry matches every registered method whose name starts with it, e.g. 'sasl_gssapi_krb' selects "
-        "all four sasl_gssapi_krb_* layers.",
+        "all three sasl_gssapi_krb_* layers.",
     )
     p.add_argument(
         "-D",
@@ -172,13 +183,14 @@ def build_credentials(args: argparse.Namespace) -> Credentials:
         key_pem=args.key_pem,
         spn_host=args.spn_host,
         propose_subkey=args.propose_subkey,
+        cksum_flags=args.cksum_flags,
         scheme=args.scheme,
     )
 
 
 def selected_method_names(spec: str) -> list[str]:
     """Each comma-separated entry is a prefix match against REGISTRY, not
-    just an exact name - 'sasl_gssapi_krb' selects all four
+    just an exact name - 'sasl_gssapi_krb' selects all three
     sasl_gssapi_krb_* layers, and a full method name still matches (it's
     a prefix of itself). Results are deduplicated but not sorted here -
     main() sorts the final selection alphabetically for display."""
