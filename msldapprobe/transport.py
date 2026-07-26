@@ -202,6 +202,38 @@ class LDAPTransport(LDAPConnection):
             )
         self._sasl_buf += chunk
 
+    @staticmethod
+    def _ber_message_length(buf: bytes) -> Optional[int]:
+        """Total size (header + body) of the LDAPMessage at the head of buf,
+        or None while buf is still too short to tell or doesn't start one."""
+        if len(buf) < 2 or buf[0] != 0x30:
+            return None
+        n = buf[1]
+        if n < 0x80:  # short form
+            return 2 + n
+        count = n & 0x7F  # long form: low 7 bits give the length-octet count
+        if count == 0 or count > 4 or len(buf) < 2 + count:
+            return None
+        return 2 + count + int.from_bytes(buf[2 : 2 + count], "big")
+
+    def _read_plain_ldap_message(self) -> bytes:
+        """Reads one *unwrapped* LDAPMessage, sized by its own BER header
+        rather than by a SASL length prefix."""
+        while True:
+            total = self._ber_message_length(self._sasl_buf)
+            if total is None:
+                if len(self._sasl_buf) >= 6:
+                    raise LDAPSessionError(
+                        errorString="unwrapped data at the head of the stream "
+                        "is not a valid LDAPMessage"
+                    )
+                self._fill_sasl_buf()
+                continue
+            if len(self._sasl_buf) >= total:
+                msg, self._sasl_buf = self._sasl_buf[:total], self._sasl_buf[total:]
+                return msg
+            self._fill_sasl_buf()
+
     def _read_sasl_frame(self) -> bytes:
         """Reads exactly one length-prefixed SASL frame, keeping anything read
         past its end buffered for the next call."""
@@ -257,7 +289,21 @@ class LDAPTransport(LDAPConnection):
 
         plaintext = b""
         while True:
-            plaintext += self.decrypt(self._read_sasl_frame())
+            while not self._sasl_buf:
+                self._fill_sasl_buf()
+            # A peer can drop the security layer mid-connection: Active
+            # Directory sends its Notice of Disconnection unwrapped, as plain
+            # BER, while tearing the connection down. Assuming a length prefix
+            # regardless reads 30 84 00 00 as a 813MB frame and waits for it,
+            # so the server's own explanation is lost and the caller sees only
+            # a reset. A leading 0x30 is an unambiguous discriminator: it marks
+            # a universal constructed SEQUENCE, and as the top byte of a
+            # 32-bit SASL length it would mean a frame far past any server's
+            # maxbuf.
+            if self._sasl_buf[0] == 0x30:
+                plaintext += self._read_plain_ldap_message()
+            else:
+                plaintext += self.decrypt(self._read_sasl_frame())
             if self._batch_is_complete(plaintext):
                 break
 
