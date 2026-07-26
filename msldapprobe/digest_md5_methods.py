@@ -156,12 +156,25 @@ class DigestMd5ConfLayerStrategy:
     server_seal_key: bytes  # Kcs
     send_seq: int = 0
     recv_seq: int = 0
+    _send_cipher: object = None
+    _recv_cipher: object = None
+
+    def __post_init__(self) -> None:
+        # RFC 2831 §2.4 keys ONE continuous RC4 stream per direction for the
+        # life of the connection - the keystream carries over from each message
+        # to the next, exactly like NTLM's connection-oriented mode. Building a
+        # fresh ARC4 per call instead restarts the keystream at position 0
+        # every time, which decrypts the first message correctly and turns
+        # every subsequent one into garbage. With a single wrapped message per
+        # connection that never surfaces; it appears the moment a second
+        # arrives - a DC bundling results across frames, say.
+        self._send_cipher = ARC4.new(self.client_seal_key)
+        self._recv_cipher = ARC4.new(self.server_seal_key)
 
     def wrap(self, plaintext: bytes) -> bytes:
         seq = struct.pack("!I", self.send_seq)
         mac = _hmac_md5(self.client_sign_key, seq + plaintext)[:10]
-        cipher = ARC4.new(self.client_seal_key)
-        ciphertext = cipher.encrypt(plaintext + mac)
+        ciphertext = self._send_cipher.encrypt(plaintext + mac)
         wrapped = ciphertext + b"\x00\x01" + seq
         self.send_seq += 1
         return wrapped
@@ -169,8 +182,7 @@ class DigestMd5ConfLayerStrategy:
     def unwrap(self, wrapped: bytes) -> bytes:
         # Strip trailing 0x0001 (2 bytes) + seqnum (4 bytes)
         ciphertext = wrapped[:-6]
-        cipher = ARC4.new(self.server_seal_key)
-        decrypted = cipher.decrypt(ciphertext)
+        decrypted = self._recv_cipher.decrypt(ciphertext)
         msg = decrypted[:-10]
         self.recv_seq += 1
         return msg

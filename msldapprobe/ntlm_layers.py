@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass
+from typing import Optional
 
 from Cryptodome.Cipher import ARC4
 from impacket.ntlm import (
@@ -94,36 +95,39 @@ def build_type1(domain: str, layer: str, with_mic: bool = False) -> NTLMAuthNego
 class NTLMLayerStrategy:
     """Post-bind LDAP message wrap/unwrap for a completed NTLM handshake.
     Four independent RC4 handles (client-send/client-recv share a key but
-    are separate keystream positions - same reasoning as ldapx's own Go
-    NTLMDirectionCipher: unwrapping and re-sealing are each their own RC4
-    stream advance even when both use the same key).
+    are separate keystream positions).
 
-    wire_seal (whether the actual wire framing encrypts, not just signs) is
-    deliberately NOT the same thing as whether NTLMSSP_NEGOTIATE_SEAL was
-    negotiated: confirmed empirically against a real DC that its LDAP/NTLM
-    implementation always uses the sealed wire format once ANY session
-    security (sign or seal) is active - "sign but don't encrypt" is a real,
-    independent NTLM flag combination, but not one AD's LDAP layer actually
-    honors distinctly at the framing level. negotiated_seal is kept
-    separately for accurate reporting of what was actually asked for in the
-    handshake.
+    Two behaviours here are not what the spec describes, and both were
+    established against a live DC:
 
-    SEAL-without-SIGN (sasl_*_ntlm_sealonly) uses a different keystream
-    discipline (see `datagram`). Cracked from a live DC capture: a real
-    Windows DC re-keys its RC4 sealing per message with the connectionless
-    formula MD5(SealingKey || le32(seqNum)) - even over connection-oriented
-    LDAP - specifically when SEAL is negotiated without SIGN. MS-NLMP §3.4.3
-    documents that rekey for connectionless mode only; connection-oriented
-    LDAP is supposed to use a single continuous RC4 stream (and does for
-    signonly/signseal), but in reality Windows does not for the sealed-only
-    case, which no Microsoft spec documents. Without matching it the DC can't
-    decrypt our continuously-sealed request and replies with an unsolicited
-    "Error decrypting ldap message"."""
+    1. Outbound framing (`seal_out`). Defaults to exactly what
+       NTLMSSP_NEGOTIATE_SEAL says, so a sign-only negotiation really does
+       put a signed cleartext body on the wire, per MS-NLMP §3.4.3, and the
+       layer names describe what they actually produce. Active Directory
+       will not accept that: a SIGN-without-SEAL bind succeeds, but the DC
+       then unseals every post-bind body regardless of the negotiated flags
+       and answers a cleartext one with an unsolicited Notice of
+       Disconnection before closing the connection.  
+       --ntlm-always-seal seals the SIGN-only case too, making the NTLM signonly variant 
+       equivalent to the signseal with respect to the post-bind wire format
+       (varying only in the negotiation preamble).
+
+    2. Inbound framing (`seal_in`). Detected from the response rather than
+       configured, because the DC seals its replies either way - including
+       its rejection of a cleartext request. See unwrap().
+
+    Separately, SEAL-without-SIGN (`sasl_*_ntlm_sealonly`) uses a different
+    keystream discipline - see `datagram`. A real Windows DC re-keys its RC4
+    sealing per message with the connectionless formula
+    MD5(SealingKey || le32(seqNum)), even over connection-oriented LDAP.
+    MS-NLMP §3.4.3 documents that rekey for connectionless mode only;
+    connection-oriented LDAP is supposed to use one continuous stream, and
+    does for signonly/signseal. No Microsoft spec documents the exception."""
 
     name: str
     flags: int
     negotiated_seal: bool  # NTLMSSP_NEGOTIATE_SEAL bit, as actually negotiated
-    wire_seal: bool  # whether wrap/unwrap actually encrypt on the wire
+    seal_out: bool  # whether what we send is encrypted
     datagram: bool  # per-message MD5(SealKey||seq) rekey (SEAL without SIGN); else continuous RC4
     client_sign_key: bytes
     client_seal_key: bytes  # base sealing key, client->server
@@ -135,6 +139,10 @@ class NTLMLayerStrategy:
     server_seal_handle: object
     send_seq: int = 0
     recv_seq: int = 0
+    # Latched on the first response: whether the peer seals what it sends.
+    # None until then. See unwrap() for why this is detected, and why it is
+    # decided once rather than per message.
+    seal_in: Optional[bool] = None
 
     def _handle(self, base_key: bytes, seq: int, continuous):
         # Datagram mode: fresh RC4 keyed by MD5(SealingKey || le32(seq)) per
@@ -148,7 +156,7 @@ class NTLMLayerStrategy:
         handle = self._handle(
             self.client_seal_key, self.send_seq, self.client_seal_handle
         )
-        if self.wire_seal:
+        if self.seal_out:
             # SEAL's sealingKey parameter is accepted but unused by impacket's
             # own implementation - encryption comes entirely from `handle` -
             # so the signing key is passed for both positions.
@@ -172,22 +180,72 @@ class NTLMLayerStrategy:
     def unwrap(self, wrapped: bytes) -> bytes:
         # NTLM's native wrapped-message framing: 16-byte
         # NTLMSSP_MESSAGE_SIGNATURE first, then the (possibly sealed)
-        # payload - same order ldapx's own Go code assumes.
+        # payload - the opposite order from RFC 4752's GSS_Wrap convention,
+        # which puts the trailing MIC after the payload.
         signature, payload = wrapped[:16], wrapped[16:]
         handle = self._handle(
             self.server_seal_key, self.recv_seq, self.server_seal_handle
         )
-        if self.wire_seal:
+        # Inbound framing is detected, not assumed: the DC seals its replies
+        # whenever any security layer is active, even when it agreed to
+        # SIGN-without-SEAL and even when what we sent was cleartext. Reading
+        # it off the wire keeps sign-only usable in both directions and lets
+        # the DC's own error reach the caller instead of arriving as noise.
+        #
+        # Decided once and latched, because guessing wrong costs the whole
+        # connection: a body we decline to decrypt leaves the RC4 handle
+        # len(payload) bytes behind where the sender left it, and every later
+        # message decrypts to garbage. The framing cannot change mid-session,
+        # so one strong check beats re-guessing per message.
+        if self.seal_in is None:
+            self.seal_in = not _looks_like_cleartext_ldap(payload)
+        if self.seal_in:
             plain = handle(payload)  # RC4 is symmetric: same handle decrypts
         else:
             plain = payload
-        del signature  # verification is best-effort/out of scope for this tester
+        # MS-NLMP §3.4.4: MAC() always runs its 8-byte checksum through the
+        # same RC4 handle, whether or not the body itself was sealed - the
+        # sender did (impacket's SEAL()/SIGN() both consume it), so a receiver
+        # that skips it leaves this handle 8 bytes behind the sender's for
+        # every message. With a single wrapped message per connection that
+        # never surfaces; the moment a second one arrives - a DC bundling
+        # results across frames, say - it decrypts to garbage. Consumed
+        # here rather than verified, keeping signature
+        # checking out of scope while still tracking the keystream correctly.
+        handle(b"\x00" * 8)
+        del signature  # signature verification is out of scope for this tester
         self.recv_seq += 1
         return plain
 
 
+def _looks_like_cleartext_ldap(payload: bytes) -> bool:
+    """Whether payload is an unencrypted LDAPMessage rather than ciphertext.
+
+    Checking only for a leading 0x30 would misfire on roughly 1 in 256 sealed
+    bodies, and a single misfire desynchronises the RC4 stream for the rest of
+    the connection. So the BER length header is decoded as well and required
+    to account for the payload exactly (a single message) or to fit inside it
+    (a bundle) - which random ciphertext will essentially never satisfy.
+    """
+    if len(payload) < 2 or payload[0] != 0x30:
+        return False
+    n = payload[1]
+    if n < 0x80:  # short form
+        total, body_len = 2, n
+    else:  # long form: low 7 bits give the number of length octets
+        count = n & 0x7F
+        if count == 0 or count > 4 or len(payload) < 2 + count:
+            return False
+        total, body_len = 2 + count, int.from_bytes(payload[2 : 2 + count], "big")
+    return total + body_len <= len(payload)
+
+
 def build_ntlm_layer_strategy(
-    layer: str, flags: int, exported_session_key: bytes, gss_wrapped: bool = False
+    layer: str,
+    flags: int,
+    exported_session_key: bytes,
+    gss_wrapped: bool = False,
+    always_seal: bool = False,
 ) -> NTLMLayerStrategy:
     client_sign_key = SIGNKEY(flags, exported_session_key, mode="Client")
     server_sign_key = SIGNKEY(flags, exported_session_key, mode="Server")
@@ -205,7 +263,17 @@ def build_ntlm_layer_strategy(
         name=f"ntlm_{layer}",
         flags=flags,
         negotiated_seal=bool(flags & NTLMSSP_NEGOTIATE_SEAL),
-        wire_seal=bool(flags & (NTLMSSP_NEGOTIATE_SIGN | NTLMSSP_NEGOTIATE_SEAL)),
+        # Honest by default: encrypt only what SEAL was negotiated for. With
+        # --ntlm-always-seal, a SIGN-only negotiation seals too, which is what
+        # Active Directory requires (see the class docstring).
+        seal_out=bool(
+            flags
+            & (
+                (NTLMSSP_NEGOTIATE_SIGN | NTLMSSP_NEGOTIATE_SEAL)
+                if always_seal
+                else NTLMSSP_NEGOTIATE_SEAL
+            )
+        ),
         datagram=datagram,
         client_sign_key=client_sign_key,
         client_seal_key=client_seal_key,
@@ -257,6 +325,10 @@ def complete_ntlm_handshake(
         version=version,
     )
     strategy = build_ntlm_layer_strategy(
-        layer, type3["flags"], exported_session_key, gss_wrapped=gss_wrapped
+        layer,
+        type3["flags"],
+        exported_session_key,
+        gss_wrapped=gss_wrapped,
+        always_seal=creds.ntlm_always_seal,
     )
     return type3, strategy, exported_session_key

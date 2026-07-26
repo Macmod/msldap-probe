@@ -247,8 +247,8 @@ _register_spnego_ntlm()
 # sasl_gssapi_ntlm_* - SASL mechanism literally "GSSAPI", NTLM negotiated
 # underneath with no SPNEGO envelope at all. A non-standard Windows SSPI
 # fallback (observed once GSS-SPNEGO isn't offered) with no impacket
-# reference to reuse - built from a real live capture analyzed against
-# ldapx earlier: the client sends bare NTLMSSP Type1/Type3 messages
+# reference to reuse - built from a real live capture: the client sends
+# bare NTLMSSP Type1/Type3 messages
 # directly as the SASL credentials field, and the DC wraps its own Type2
 # challenge response in an ad-hoc [3]{OCTET STRING "GSSAPI", OCTET STRING
 # <ntlm>} shape - not RFC 2743's GSS-API envelope, not SPNEGO. No
@@ -260,8 +260,9 @@ _register_spnego_ntlm()
 
 def _extract_ntlm_message(data: bytes) -> bytes:
     """Bare NTLMSSP signature search, tolerating both a fully bare message
-    and one embedded in the DC's ad-hoc wrapper - mirrors ldapx's own
-    extractGSSAPINTLMMessage (decrypt/bindsession.go) exactly."""
+    and one embedded in the DC's ad-hoc wrapper. Searching for the 8-byte
+    magic rather than parsing structurally handles both shapes uniformly;
+    a collision inside legitimate binary data isn't a realistic concern."""
     idx = data.find(b"NTLMSSP\x00")
     if idx < 0:
         raise ValueError("no NTLMSSP message found in SASL/GSSAPI response")

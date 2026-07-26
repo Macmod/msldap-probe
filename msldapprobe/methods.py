@@ -42,8 +42,7 @@ class Credentials:
     scheme: str = "ldap"
     # The LDAP service's real hostname for Kerberos SPN construction
     # (ldap/<spn_host>) - target is very often a bare IP, and AD doesn't
-    # register SPNs against IPs (the same issue ldapx's own Kerberos
-    # forwarder work hit earlier). Defaults to target if not given, which
+    # register SPNs against IPs. Defaults to target if not given, which
     # only works when target already is a resolvable hostname.
     spn_host: Optional[str] = None
     # Which subkey etype to propose in the Kerberos AP-REQ Authenticator's
@@ -60,6 +59,15 @@ class Credentials:
     # (GSSAPI: 0x03, SPNEGO: derived from the bind's own layer). Ignored by
     # non-Kerberos methods.
     cksum_flags: int | None = None
+    # Whether an NTLM layer that negotiated SIGN without SEAL should
+    # nonetheless encrypt what it sends. False (default) puts on the wire
+    # exactly what the negotiated flags describe, so sign-only really is
+    # signed-not-encrypted. True reproduces what Active Directory requires -
+    # it unseals every post-bind body once any security layer is active, and
+    # answers a cleartext one with an unsolicited Notice of Disconnection
+    # ("Error decrypting ldap message"), so sign-only only completes against
+    # a DC with this set. Ignored by non-NTLM methods.
+    ntlm_always_seal: bool = False
 
     def __post_init__(self) -> None:
         if not self.spn_host:

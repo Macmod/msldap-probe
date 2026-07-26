@@ -21,9 +21,8 @@ from msldapprobe import krb_methods  # noqa: E402,F401 - populates REGISTRY as a
 from msldapprobe import digest_md5_methods  # noqa: E402,F401 - populates REGISTRY as a side effect
 
 
-# Same red/yellow/green/cyan-for-info convention ldapx (this repo's own Go
-# tool) already uses - PASS=green, PARTIAL=yellow (a real finding, not a
-# clean pass), FAIL=red, SKIP=cyan (neutral/informational, not an error).
+# PASS=green, PARTIAL=yellow (a real finding, not a clean pass), FAIL=red,
+# SKIP=cyan (neutral/informational, not an error).
 _ANSI = {
     "green": "\033[32m",
     "yellow": "\033[33m",
@@ -131,6 +130,17 @@ def parse_args() -> argparse.Namespace:
         "bind's own layer). Ignored by non-Kerberos methods.",
     )
     p.add_argument(
+        "--ntlm-always-seal",
+        action="store_true",
+        help="Encrypt outgoing NTLM traffic even when only NTLMSSP_NEGOTIATE_SIGN "
+        "was negotiated. Off by default, so the *_ntlm_signonly methods put a "
+        "signed cleartext body on the wire, exactly as the negotiated flags "
+        "describe. Active Directory rejects that - it unseals every post-bind "
+        "body once any security layer is active and answers a cleartext one "
+        "with 'Error decrypting ldap message' - so this must be set for "
+        "sign-only to complete against a DC. Ignored by non-NTLM methods.",
+    )
+    p.add_argument(
         "-C", "--cert-pem", default=None, help="Client certificate PEM (sasl_external)"
     )
     p.add_argument(
@@ -148,9 +158,11 @@ def parse_args() -> argparse.Namespace:
         "-m",
         "--methods",
         default="all",
-        help="Comma-separated method names or prefixes, or 'all' (see methods.py REGISTRY for the full list). "
-        "Each entry matches every registered method whose name starts with it, e.g. 'sasl_gssapi_krb' selects "
-        "all three sasl_gssapi_krb_* layers.",
+        help="Comma-separated method names, prefixes or aliases, or 'all' (see methods.py REGISTRY for the "
+        "full list). A prefix matches every method whose name starts with it, e.g. 'sasl_gssapi_krb' selects "
+        "all three sasl_gssapi_krb_* layers. Aliases select across that naming instead - by SASL carrier "
+        "('gssapi', 'spnego'), authentication family ('kerberos', 'ntlm'), or security layer ('plain', "
+        "'signonly', 'sealonly', 'signseal'). Combine freely: '-m spnego,sealonly' selects both sets.",
     )
     p.add_argument(
         "-D",
@@ -189,16 +201,47 @@ def build_credentials(args: argparse.Namespace) -> Credentials:
         spn_host=args.spn_host,
         propose_subkey=args.propose_subkey,
         cksum_flags=args.cksum_flags,
+        ntlm_always_seal=args.ntlm_always_seal,
         scheme=args.scheme,
     )
 
 
+# A method name encodes three independent dimensions - SASL carrier,
+# authentication family, security layer - but only in that fixed order
+# (sicily_ntlm_*, sasl_spnego_krb_*, ...), so prefix selection can only ever
+# slice along the first. These aliases slice along each dimension
+# separately. None is also a prefix of any method name ("gssapi" never
+# starts one; they all begin "sasl_"), so resolving aliases first cannot
+# shadow a prefix the caller meant.
+#
+# sicily needs no alias - it leads its method names, so the prefix already
+# selects exactly that carrier.
+#
+# The layer aliases match the *_<layer> suffix, so they cover only methods
+# that negotiate a layer at all - anonymous_bind, simple_bind and
+# sasl_external have no layer dimension and are reachable by name or 'all'.
+METHOD_ALIASES = {
+    # SASL carrier
+    "gssapi": lambda name: "_gssapi_" in name,
+    "spnego": lambda name: "_spnego_" in name,
+    # authentication family
+    "kerberos": lambda name: "_krb_" in name,
+    "ntlm": lambda name: "_ntlm_" in name,
+    # security layer
+    "plain": lambda name: name.endswith("_plain"),
+    "signonly": lambda name: name.endswith("_signonly"),
+    "sealonly": lambda name: name.endswith("_sealonly"),
+    "signseal": lambda name: name.endswith("_signseal"),
+}
+
+
 def selected_method_names(spec: str) -> list[str]:
-    """Each comma-separated entry is a prefix match against REGISTRY, not
-    just an exact name - 'sasl_gssapi_krb' selects all three
-    sasl_gssapi_krb_* layers, and a full method name still matches (it's
-    a prefix of itself). Results are deduplicated but not sorted here -
-    main() sorts the final selection alphabetically for display."""
+    """Each comma-separated entry is an alias (see METHOD_ALIASES) or a
+    prefix match against REGISTRY, not just an exact name -
+    'sasl_gssapi_krb' selects all three sasl_gssapi_krb_* layers, and a
+    full method name still matches (it's a prefix of itself). Results are
+    deduplicated but not sorted here - main() sorts the final selection
+    alphabetically for display."""
     if spec.strip().lower() == "all":
         return list(REGISTRY.keys())
     tokens = [t.strip() for t in spec.split(",") if t.strip()]
@@ -206,7 +249,11 @@ def selected_method_names(spec: str) -> list[str]:
     seen: set[str] = set()
     unmatched = []
     for token in tokens:
-        matches = [name for name in REGISTRY if name.startswith(token)]
+        alias = METHOD_ALIASES.get(token.lower())
+        if alias is not None:
+            matches = [name for name in REGISTRY if alias(name)]
+        else:
+            matches = [name for name in REGISTRY if name.startswith(token)]
         if not matches:
             unmatched.append(token)
             continue
@@ -216,7 +263,9 @@ def selected_method_names(spec: str) -> list[str]:
                 selected.append(name)
     if unmatched:
         raise SystemExit(
-            f"no method matches prefix(es): {', '.join(unmatched)}\navailable: {', '.join(sorted(REGISTRY))}"
+            f"no method matches: {', '.join(unmatched)}\n"
+            f"aliases: {', '.join(sorted(METHOD_ALIASES))}, all\n"
+            f"methods: {', '.join(sorted(REGISTRY))}"
         )
     return selected
 
@@ -245,7 +294,7 @@ def run_method(name: str, creds: Credentials) -> tuple[str, str]:
         ok, detail = transport.verify_rootdse_namingcontexts()
         if ok:
             return "PASS", outcome.detail
-        return "PARTIAL", f"bind ok, post-bind operation failed: {detail}"
+        return "PARTIAL", f"bind ok, post-bind search failed: {detail}"
     except Exception as exc:
         return "FAIL", f"exception: {exc}"
     finally:

@@ -13,7 +13,8 @@ import socket
 import struct
 from typing import Optional
 
-from pyasn1.codec.ber import encoder
+from pyasn1.codec.ber import decoder, encoder
+from pyasn1.error import SubstrateUnderrunError
 
 from impacket.ldap.ldap import LDAPConnection, LDAPSearchError, LDAPSessionError
 from impacket.ldap.ldapasn1 import (
@@ -58,6 +59,9 @@ class LDAPTransport(LDAPConnection):
         self._LDAPConnection__signing = signing
         self.layer_strategy: Optional[LayerStrategy] = None
         self._next_message_id = 1
+        # Bytes read past the end of the SASL frame currently being consumed;
+        # they belong to the next frame. See recv_raw().
+        self._sasl_buf = b""
 
     def upgrade_tls(
         self, cert_pem: Optional[str] = None, key_pem: Optional[str] = None
@@ -136,6 +140,134 @@ class LDAPTransport(LDAPConnection):
         # after those 4 bytes needs unwrapping.
         return self.layer_strategy.unwrap(data[4:])
 
+    _NON_TERMINAL_OPS = ("searchResEntry", "searchResRef")
+    # RFC 4511 §4.4.1 Notice of Disconnection.
+    _NOTICE_OF_DISCONNECTION = "1.3.6.1.4.1.1466.20036"
+
+    def _disconnect_notice(self, plaintext: bytes) -> Optional[str]:
+        """The server's own diagnostic if plaintext carries an unsolicited
+        Notice of Disconnection, else None.
+
+        Worth pulling out because it is the most informative thing a DC ever
+        says: it explains why it is about to hang up, in its own words. It
+        arrives as messageID 0, which no request ever matches, so impacket's
+        operation loops don't recognise it - search() keeps waiting for a
+        searchResDone that will never come, and the caller ends up with a
+        pyasn1 complaint instead of the reason. Reporting it verbatim turns
+        a mechanism failure into a readable one (e.g. a sign-only bind that
+        sent a cleartext body gets back "Error decrypting ldap message").
+        """
+        def opt(container, field):
+            """An optional ASN.1 field as str, or None if absent. pyasn1
+            raises on an unset optional rather than returning something
+            testable, so absence has to be caught rather than checked."""
+            try:
+                value = container[field]
+                return str(value) if value.hasValue() else None
+            except Exception:
+                return None
+
+        data = plaintext
+        while data:
+            try:
+                msg, data = decoder.decode(data, asn1Spec=LDAPMessage())
+            except Exception:
+                return None
+            try:
+                if int(msg["messageID"]) != 0:
+                    continue
+                op = msg["protocolOp"]
+                if op.getName() != "extendedResp":
+                    continue
+                resp = op.getComponent()
+                # impacket declares responseName/responseValue as optional
+                # fields of LDAPMessage itself, not of ExtendedResponse, and
+                # a real notice puts the OID after the extendedResp element
+                # in the outer SEQUENCE - so look there first, and fall back
+                # to the nested position for servers that use it.
+                oid = opt(msg, "responseName") or opt(resp, "responseName")
+                if oid != self._NOTICE_OF_DISCONNECTION:
+                    continue
+                diagnostic = opt(resp, "diagnosticMessage") or ""
+                return diagnostic.rstrip("\x00").strip()
+            except Exception:
+                continue
+        return None
+
+    def _fill_sasl_buf(self) -> None:
+        chunk = self._socket.recv(8192)
+        if not chunk:
+            raise LDAPSessionError(
+                errorString="connection closed while reading a SASL frame"
+            )
+        self._sasl_buf += chunk
+
+    def _read_sasl_frame(self) -> bytes:
+        """Reads exactly one length-prefixed SASL frame, keeping anything read
+        past its end buffered for the next call."""
+        while len(self._sasl_buf) < 4:
+            self._fill_sasl_buf()
+        length = struct.unpack("!I", self._sasl_buf[:4])[0]
+        while len(self._sasl_buf) < 4 + length:
+            self._fill_sasl_buf()
+        end = 4 + length
+        frame, self._sasl_buf = self._sasl_buf[:end], self._sasl_buf[end:]
+        return frame
+
+    def _batch_is_complete(self, plaintext: bytes) -> bool:
+        """True once plaintext decodes to whole LDAPMessages ending in one that
+        terminates the operation. Search entries and references don't - their
+        searchResDone may still be in a later frame."""
+        data = plaintext
+        last = None
+        while data:
+            try:
+                last, data = decoder.decode(data, asn1Spec=LDAPMessage())
+            except SubstrateUnderrunError:
+                return False  # a message straddles the frame boundary
+        if last is None:
+            return False
+        try:
+            return last["protocolOp"].getName() not in self._NON_TERMINAL_OPS
+        except Exception:
+            return True  # unrecognizable shape: hand it up rather than block
+
+    def recv_raw(self) -> bytes:
+        """Overrides the base class's recv_raw(), which cannot read a response
+        spanning more than one SASL frame.
+
+        impacket sizes the frame from the first 4 bytes and then loops
+        `while message_length != len(data) - 4`, an equality test that cannot
+        tell an over-read from an under-read: if a single socket read happens
+        to contain two frames, len(data)-4 exceeds message_length, the
+        condition never clears, and it blocks on recv() forever waiting for
+        bytes that will never arrive. Any peer that emits two frames back to
+        back triggers it - a DC returning a large result set, for instance.
+
+        Fixing only that would still leave search() broken: it loops on
+        sendReceive(), so a batch arriving without its searchResDone makes it
+        re-send the whole SearchRequest rather than read the next frame. So
+        frames are read one at a time (exactly, with the remainder buffered)
+        and their plaintexts concatenated until the batch ends in a message
+        that terminates the operation - restoring the "one recv_raw() returns
+        the whole response" contract the unsigned path already has.
+        """
+        if not (self._LDAPConnection__binded and self._LDAPConnection__signing):
+            return super().recv_raw()
+
+        plaintext = b""
+        while True:
+            plaintext += self.decrypt(self._read_sasl_frame())
+            if self._batch_is_complete(plaintext):
+                break
+
+        notice = self._disconnect_notice(plaintext)
+        if notice is not None:
+            raise LDAPSessionError(
+                errorString=f"server sent a Notice of Disconnection: {notice}"
+            )
+        return plaintext
+
     def mark_bound(self, layer_strategy: Optional[LayerStrategy]) -> None:
         """Called by a bind builder once its handshake succeeds. Sets the
         base class's private __binded flag via its name-mangled attribute
@@ -171,7 +303,9 @@ class LDAPTransport(LDAPConnection):
         except LDAPSearchError as exc:
             return False, f"search failed: {exc}"
         except Exception as exc:  # wrap/unwrap errors, malformed responses, etc.
-            return False, f"post-bind operation failed: {exc}"
+            # Bare reason, no prefix - the caller already frames this as the
+            # post-bind search failing.
+            return False, str(exc)
 
         for entry in results:
             for attr in entry["attributes"]:
@@ -231,10 +365,17 @@ def open_transport(
     # included. So a URL only gets a ":port" suffix when --port explicitly
     # overrides the default; appending it unconditionally breaks
     # getaddrinfo() for the common (default-port) case.
-    def _url(url_scheme: str, default_port: int) -> str:
-        if port and port != default_port:
-            return f"{url_scheme}://{target}:{port}"
-        return f"{url_scheme}://{target}"
+    # ...which also means a ":port" suffix can never work: it lands in the
+    # hostname, and getaddrinfo() fails on "localhost:3389". Redirecting
+    # getaddrinfo is the only way to reach a non-default port, so --port goes
+    # through that for every scheme rather than only for the ldaps+cert path.
+    def _connect(url_scheme: str, default_port: int) -> LDAPTransport:
+        url = f"{url_scheme}://{target}"
+        effective = port or default_port
+        if effective == default_port:
+            return LDAPTransport(url, dst_ip=dst_ip, signing=signing)
+        with _redirect_getaddrinfo_port(effective):
+            return LDAPTransport(url, dst_ip=dst_ip, signing=signing)
 
     if scheme == "ldaps":
         if cert_pem and key_pem:
@@ -251,18 +392,9 @@ def open_transport(
                 )
             transport.upgrade_tls(cert_pem, key_pem)
             return transport
-        return LDAPTransport(_url("ldaps", 636), dst_ip=dst_ip, signing=signing)
+        return _connect("ldaps", 636)
 
-    # When dst_ip is set and port differs from the scheme default, the
-    # base class connects to (dstIp, defaultPort) ignoring both the URL
-    # port and our actual port argument.  Redirect getaddrinfo so the
-    # socket connects to the right port.
-    _target_port = port or 389
-    if dst_ip is not None and _target_port != 389:
-        with _redirect_getaddrinfo_port(_target_port):
-            transport = LDAPTransport(_url("ldap", 389), dst_ip=dst_ip, signing=signing)
-    else:
-        transport = LDAPTransport(_url("ldap", 389), dst_ip=dst_ip, signing=signing)
+    transport = _connect("ldap", 389)
     if scheme == "starttls":
         transport.start_tls(cert_pem, key_pem)
     return transport
