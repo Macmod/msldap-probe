@@ -34,7 +34,7 @@ import re
 import struct
 from dataclasses import dataclass
 
-from Cryptodome.Cipher import ARC4
+from Cryptodome.Cipher import ARC4, DES, DES3
 
 from impacket.ldap.ldapasn1 import BindRequest, ResultCode
 
@@ -137,16 +137,48 @@ class DigestMd5IntLayerStrategy:
         return msg
 
 
+def _des_expand_key(seven: bytes) -> bytes:
+    """Spread a 7-byte (56-bit) string across the 8 bytes of a DES key,
+    leaving the low bit of each output byte as the (unused) parity bit.
+
+    RFC 2831 §2.2.2 says only that the DES key is "the first 7 bytes" of
+    Kcc/Kcs and never states this expansion, so the bit layout is taken from
+    the reference implementation everything interoperates with - Cyrus SASL's
+    slidebits() in plugins/digestmd5.c.
+    """
+    return bytes(
+        [
+            seven[0] & 0xFF,
+            ((seven[0] << 7) | (seven[1] >> 1)) & 0xFF,
+            ((seven[1] << 6) | (seven[2] >> 2)) & 0xFF,
+            ((seven[2] << 5) | (seven[3] >> 3)) & 0xFF,
+            ((seven[3] << 4) | (seven[4] >> 4)) & 0xFF,
+            ((seven[4] << 3) | (seven[5] >> 5)) & 0xFF,
+            ((seven[5] << 2) | (seven[6] >> 6)) & 0xFF,
+            (seven[6] << 1) & 0xFF,
+        ]
+    )
+
+
 @dataclass
 class DigestMd5ConfLayerStrategy:
-    """auth-conf: RC4 encryption + HMAC-MD5 integrity.
+    """auth-conf: encryption + HMAC-MD5 integrity.
 
-    Wire format inside the 4-byte SASL length frame:
+    Wire format inside the 4-byte SASL length frame, for a stream cipher:
         RC4(encoded_message || MAC(10 bytes)) || 0x0001(2) || seqnum(4 BE)
 
-    The MAC and seqnum are computed over the plaintext, then the
-    message+MAC is RC4-encrypted.  The 0x0001 and seqnum travel in
-    cleartext after the ciphertext.
+    and for a block cipher, which additionally pads so the encrypted unit is
+    a whole number of blocks:
+        CBC(encoded_message || pad || MAC(10)) || 0x0001(2) || seqnum(4 BE)
+
+    The MAC is computed over the unpadded plaintext and travels inside the
+    ciphertext; the 0x0001 and seqnum are always cleartext after it.
+
+    `des` and `3des` need three things RFC 2831 does not state, all taken
+    from Cyrus SASL: the 7-to-8 byte key expansion (see _des_expand_key),
+    two-key EDE for 3des with K1 = slide(Kc[0:7]) and K2 = slide(Kc[7:14]),
+    and a CBC IV that starts at Kc[8:16] and then chains from message to
+    message rather than restarting.
     """
 
     name: str
@@ -154,27 +186,50 @@ class DigestMd5ConfLayerStrategy:
     server_sign_key: bytes  # Kis
     client_seal_key: bytes  # Kcc
     server_seal_key: bytes  # Kcs
+    cipher: str = "rc4"
     send_seq: int = 0
     recv_seq: int = 0
     _send_cipher: object = None
     _recv_cipher: object = None
+    _block_size: int = 0
+
+    def _build(self, seal_key: bytes):
+        name = self.cipher.lower()
+        if name in ("des", "3des"):
+            iv = seal_key[8:16]
+            if name == "des":
+                key = _des_expand_key(seal_key[0:7])
+                return DES.new(key, DES.MODE_CBC, iv), DES.block_size
+            k1 = _des_expand_key(seal_key[0:7])
+            k2 = _des_expand_key(seal_key[7:14])
+            return DES3.new(k1 + k2 + k1, DES3.MODE_CBC, iv), DES3.block_size
+        # rc4, rc4-40 and rc4-56 all key RC4 with the whole 16-byte Kcc/Kcs;
+        # the reduced variants weaken the derivation, not the key handed over.
+        return ARC4.new(seal_key), 0
 
     def __post_init__(self) -> None:
-        # RFC 2831 §2.4 keys ONE continuous RC4 stream per direction for the
-        # life of the connection - the keystream carries over from each message
-        # to the next, exactly like NTLM's connection-oriented mode. Building a
-        # fresh ARC4 per call instead restarts the keystream at position 0
-        # every time, which decrypts the first message correctly and turns
-        # every subsequent one into garbage. With a single wrapped message per
-        # connection that never surfaces; it appears the moment a second
-        # arrives - a DC bundling results across frames, say.
-        self._send_cipher = ARC4.new(self.client_seal_key)
-        self._recv_cipher = ARC4.new(self.server_seal_key)
+        # RFC 2831 §2.4 keys ONE cipher per direction for the life of the
+        # connection - an RC4 keystream, or a CBC chain, carries over from
+        # each message to the next. Building a fresh cipher per call instead
+        # restarts it every time, which handles the first message correctly
+        # and turns every subsequent one into garbage. With a single wrapped
+        # message per connection that never surfaces; it appears the moment a
+        # second arrives - a DC bundling results across frames, say.
+        self._send_cipher, self._block_size = self._build(self.client_seal_key)
+        self._recv_cipher, _ = self._build(self.server_seal_key)
 
     def wrap(self, plaintext: bytes) -> bytes:
         seq = struct.pack("!I", self.send_seq)
         mac = _hmac_md5(self.client_sign_key, seq + plaintext)[:10]
-        ciphertext = self._send_cipher.encrypt(plaintext + mac)
+        body = plaintext + mac
+        if self._block_size:
+            # Pad between message and MAC so the encrypted unit is a whole
+            # number of blocks. Never empty: when the two already align this
+            # yields a full block, so the length is always recoverable from
+            # the pad's own last byte.
+            pad_len = self._block_size - ((len(plaintext) + 10) % self._block_size)
+            body = plaintext + bytes([pad_len]) * pad_len + mac
+        ciphertext = self._send_cipher.encrypt(body)
         wrapped = ciphertext + b"\x00\x01" + seq
         self.send_seq += 1
         return wrapped
@@ -184,6 +239,8 @@ class DigestMd5ConfLayerStrategy:
         ciphertext = wrapped[:-6]
         decrypted = self._recv_cipher.decrypt(ciphertext)
         msg = decrypted[:-10]
+        if self._block_size and msg:
+            msg = msg[: -msg[-1]]
         self.recv_seq += 1
         return msg
 
@@ -304,6 +361,11 @@ def _bind_digest_md5(
     followed by a final empty-credentials round.
     """
     qop, cipher, _needs_signing = _LAYER_PARAMS[layer]
+    # auth-conf can run under any cipher the server offers; --digest-md5-cipher
+    # picks which one to propose. The other QOP levels seal nothing, so the
+    # setting is irrelevant to them and their empty cipher stays empty.
+    if cipher:
+        cipher = creds.digest_md5_cipher
 
     # Round 1: initial bind with empty credentials to get the challenge.
     req = BindRequest()
@@ -455,6 +517,7 @@ def _bind_digest_md5(
                 server_sign_key=kis,
                 client_seal_key=kcc,
                 server_seal_key=kcs,
+                cipher=cipher,
             )
 
     transport.mark_bound(strategy)

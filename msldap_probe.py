@@ -130,6 +130,14 @@ def parse_args() -> argparse.Namespace:
         "bind's own layer). Ignored by non-Kerberos methods.",
     )
     p.add_argument(
+        "--digest-md5-cipher",
+        default="rc4",
+        choices=["rc4", "rc4-56", "rc4-40", "des", "3des"],
+        help="Cipher to propose for a DIGEST-MD5 auth-conf bind (RFC 2831 §2.1.2). "
+        "Default 'rc4'. The bind fails up front if the server's challenge doesn't "
+        "offer the requested cipher. Ignored by every other method.",
+    )
+    p.add_argument(
         "--ntlm-always-seal",
         action="store_true",
         help="Encrypt outgoing NTLM traffic even when only NTLMSSP_NEGOTIATE_SIGN "
@@ -202,6 +210,7 @@ def build_credentials(args: argparse.Namespace) -> Credentials:
         propose_subkey=args.propose_subkey,
         cksum_flags=args.cksum_flags,
         ntlm_always_seal=args.ntlm_always_seal,
+        digest_md5_cipher=args.digest_md5_cipher,
         scheme=args.scheme,
     )
 

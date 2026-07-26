@@ -68,6 +68,11 @@ class Credentials:
     # ("Error decrypting ldap message"), so sign-only only completes against
     # a DC with this set. Ignored by non-NTLM methods.
     ntlm_always_seal: bool = False
+    # Which cipher to propose for a DIGEST-MD5 auth-conf bind (RFC 2831
+    # §2.1.2). The bind fails up front if the server's challenge doesn't
+    # offer it. Ignored by every other method, including the other two
+    # DIGEST-MD5 QOP levels, which seal nothing.
+    digest_md5_cipher: str = "rc4"
 
     def __post_init__(self) -> None:
         if not self.spn_host:
