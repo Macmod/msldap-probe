@@ -54,9 +54,14 @@ NTLM_BASE_FLAGS = (
 # checking how strictly a target enforces flag consistency.
 LAYER_FLAGS = {
     "plain": 0,
-    "signonly": NTLMSSP_NEGOTIATE_SIGN | NTLMSSP_NEGOTIATE_ALWAYS_SIGN | NTLMSSP_NEGOTIATE_KEY_EXCH,
+    "signonly": NTLMSSP_NEGOTIATE_SIGN
+    | NTLMSSP_NEGOTIATE_ALWAYS_SIGN
+    | NTLMSSP_NEGOTIATE_KEY_EXCH,
     "sealonly": NTLMSSP_NEGOTIATE_SEAL | NTLMSSP_NEGOTIATE_KEY_EXCH,
-    "signseal": NTLMSSP_NEGOTIATE_SIGN | NTLMSSP_NEGOTIATE_ALWAYS_SIGN | NTLMSSP_NEGOTIATE_SEAL | NTLMSSP_NEGOTIATE_KEY_EXCH,
+    "signseal": NTLMSSP_NEGOTIATE_SIGN
+    | NTLMSSP_NEGOTIATE_ALWAYS_SIGN
+    | NTLMSSP_NEGOTIATE_SEAL
+    | NTLMSSP_NEGOTIATE_KEY_EXCH,
 }
 
 
@@ -75,7 +80,11 @@ def build_type1(domain: str, layer: str, with_mic: bool = False) -> NTLMAuthNego
     if with_mic:
         auth["flags"] |= NTLMSSP_NEGOTIATE_VERSION
         version = VERSION()
-        version["ProductMajorVersion"], version["ProductMinorVersion"], version["ProductBuild"] = 10, 0, 19041
+        (
+            version["ProductMajorVersion"],
+            version["ProductMinorVersion"],
+            version["ProductBuild"],
+        ) = 10, 0, 19041
         auth["os_version"] = version
     auth.setWorkstation("")
     return auth
@@ -120,7 +129,9 @@ class NTLMLayerStrategy:
     client_seal_key: bytes  # base sealing key, client->server
     server_sign_key: bytes
     server_seal_key: bytes  # base sealing key, server->client
-    client_seal_handle: object  # continuous ARC4 encrypt method (unused in datagram mode)
+    client_seal_handle: (
+        object  # continuous ARC4 encrypt method (unused in datagram mode)
+    )
     server_seal_handle: object
     send_seq: int = 0
     recv_seq: int = 0
@@ -134,15 +145,26 @@ class NTLMLayerStrategy:
         return continuous
 
     def wrap(self, plaintext: bytes) -> bytes:
-        handle = self._handle(self.client_seal_key, self.send_seq, self.client_seal_handle)
+        handle = self._handle(
+            self.client_seal_key, self.send_seq, self.client_seal_handle
+        )
         if self.wire_seal:
             # SEAL's sealingKey parameter is accepted but unused by impacket's
             # own implementation - encryption comes entirely from `handle` -
             # so the signing key is passed for both positions.
-            sealed, sig = SEAL(self.flags, self.client_sign_key, self.client_sign_key, plaintext, plaintext,
-                                self.send_seq, handle)
+            sealed, sig = SEAL(
+                self.flags,
+                self.client_sign_key,
+                self.client_sign_key,
+                plaintext,
+                plaintext,
+                self.send_seq,
+                handle,
+            )
         else:
-            sig = SIGN(self.flags, self.client_sign_key, plaintext, self.send_seq, handle)
+            sig = SIGN(
+                self.flags, self.client_sign_key, plaintext, self.send_seq, handle
+            )
             sealed = plaintext
         self.send_seq += 1
         return sig.getData() + sealed
@@ -152,7 +174,9 @@ class NTLMLayerStrategy:
         # NTLMSSP_MESSAGE_SIGNATURE first, then the (possibly sealed)
         # payload - same order ldapx's own Go code assumes.
         signature, payload = wrapped[:16], wrapped[16:]
-        handle = self._handle(self.server_seal_key, self.recv_seq, self.server_seal_handle)
+        handle = self._handle(
+            self.server_seal_key, self.recv_seq, self.server_seal_handle
+        )
         if self.wire_seal:
             plain = handle(payload)  # RC4 is symmetric: same handle decrypts
         else:
@@ -162,8 +186,9 @@ class NTLMLayerStrategy:
         return plain
 
 
-def build_ntlm_layer_strategy(layer: str, flags: int, exported_session_key: bytes,
-                              gss_wrapped: bool = False) -> NTLMLayerStrategy:
+def build_ntlm_layer_strategy(
+    layer: str, flags: int, exported_session_key: bytes, gss_wrapped: bool = False
+) -> NTLMLayerStrategy:
     client_sign_key = SIGNKEY(flags, exported_session_key, mode="Client")
     server_sign_key = SIGNKEY(flags, exported_session_key, mode="Server")
     client_seal_key = SEALKEY(flags, exported_session_key, mode="Client")
@@ -171,7 +196,11 @@ def build_ntlm_layer_strategy(layer: str, flags: int, exported_session_key: byte
     # Datagram per-message rekey applies only to GSS-wrapped NTLM (GSSAPI /
     # GSS-SPNEGO) sealed without signing - raw Sicily/SASL NTLM keeps the
     # continuous stream for the same flags (see NTLMLayerStrategy).
-    datagram = gss_wrapped and bool(flags & NTLMSSP_NEGOTIATE_SEAL) and not (flags & NTLMSSP_NEGOTIATE_SIGN)
+    datagram = (
+        gss_wrapped
+        and bool(flags & NTLMSSP_NEGOTIATE_SEAL)
+        and not (flags & NTLMSSP_NEGOTIATE_SIGN)
+    )
     return NTLMLayerStrategy(
         name=f"ntlm_{layer}",
         flags=flags,
@@ -187,8 +216,13 @@ def build_ntlm_layer_strategy(layer: str, flags: int, exported_session_key: byte
     )
 
 
-def complete_ntlm_handshake(type1: NTLMAuthNegotiate, type2_bytes: bytes, creds, layer: str,
-                            gss_wrapped: bool = False):
+def complete_ntlm_handshake(
+    type1: NTLMAuthNegotiate,
+    type2_bytes: bytes,
+    creds,
+    layer: str,
+    gss_wrapped: bool = False,
+):
     """Runs Type3 construction (reusing impacket's getNTLMSSPType3 as-is -
     it already correctly derives responseFlags as the intersection of what
     Type1 asked for and what the server's Type2 challenge actually granted)
@@ -198,7 +232,9 @@ def complete_ntlm_handshake(type1: NTLMAuthNegotiate, type2_bytes: bytes, creds,
     a different value before any real post-bind traffic exists, so they
     can use their own fresh cipher handle rather than pre-consuming
     strategy's keystream position."""
-    version = type1["os_version"] if type1["flags"] & NTLMSSP_NEGOTIATE_VERSION else None
+    version = (
+        type1["os_version"] if type1["flags"] & NTLMSSP_NEGOTIATE_VERSION else None
+    )
     # impacket's NTOWFv2 checks `if hash != ''` to decide whether a hash was
     # explicitly provided — if not, it computes the NTLM hash from the password.
     # Our Credentials stores hashes as `bytes`, so b"" (empty, no hashes) is the
@@ -210,8 +246,17 @@ def complete_ntlm_handshake(type1: NTLMAuthNegotiate, type2_bytes: bytes, creds,
     lmhash = creds.lmhash if creds.lmhash else ""
     nthash = creds.nthash if creds.nthash else ""
     type3, exported_session_key = getNTLMSSPType3(
-        type1, type2_bytes, creds.username, creds.password, creds.domain,
-        lmhash, nthash, service="ldap", version=version,
+        type1,
+        type2_bytes,
+        creds.username,
+        creds.password,
+        creds.domain,
+        lmhash,
+        nthash,
+        service="ldap",
+        version=version,
     )
-    strategy = build_ntlm_layer_strategy(layer, type3["flags"], exported_session_key, gss_wrapped=gss_wrapped)
+    strategy = build_ntlm_layer_strategy(
+        layer, type3["flags"], exported_session_key, gss_wrapped=gss_wrapped
+    )
     return type3, strategy, exported_session_key
