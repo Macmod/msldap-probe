@@ -21,22 +21,32 @@ Methods are registered in `msldapprobe/methods.py` and grouped by mechanism fami
 
 | Family | Names |
 |--------|-------|
-| Anonymous / simple / SASL EXTERNAL | `anonymous_bind`, `simple_bind`, `sasl_external` |
-| Sicily NTLM | `sicily_ntlm_plain`, `sicily_ntlm_signonly`, `sicily_ntlm_sealonly`, `sicily_ntlm_signseal` |
-| SASL GSS-SPNEGO wrapping NTLM | `sasl_spnego_ntlm_plain`, `sasl_spnego_ntlm_signonly`, `sasl_spnego_ntlm_sealonly`, `sasl_spnego_ntlm_signseal` |
-| SASL GSSAPI carrying NTLM | `sasl_gssapi_ntlm_plain`, `sasl_gssapi_ntlm_signonly`, `sasl_gssapi_ntlm_sealonly`, `sasl_gssapi_ntlm_signseal` |
-| SASL GSS-SPNEGO wrapping Kerberos | `sasl_spnego_krb_plain`, `sasl_spnego_krb_signonly`, `sasl_spnego_krb_signseal` |
-| SASL GSSAPI carrying Kerberos | `sasl_gssapi_krb_plain`, `sasl_gssapi_krb_signonly`, `sasl_gssapi_krb_signseal` |
-| SASL DIGEST-MD5 | `sasl_digest_md5_plain`, `sasl_digest_md5_signonly`, `sasl_digest_md5_signseal` |
+| Simple (anonymous) / Simple (with creds) / SASL EXTERNAL | `anonymous_bind`, `simple_bind`, `sasl_external` |
+| Sicily (NTLM) | `sicily_ntlm_plain`, `sicily_ntlm_signonly`, `sicily_ntlm_sealonly`, `sicily_ntlm_signseal` |
+| SASL/GSS-SPNEGO (NTLM) | `sasl_spnego_ntlm_plain`, `sasl_spnego_ntlm_signonly`, `sasl_spnego_ntlm_sealonly`, `sasl_spnego_ntlm_signseal` |
+| SASL/GSSAPI (NTLM) | `sasl_gssapi_ntlm_plain`, `sasl_gssapi_ntlm_signonly`, `sasl_gssapi_ntlm_sealonly`, `sasl_gssapi_ntlm_signseal` |
+| SASL/GSS-SPNEGO (Kerberos) | `sasl_spnego_krb_plain`, `sasl_spnego_krb_signonly`, `sasl_spnego_krb_signseal` |
+| SASL/GSSAPI (Kerberos) | `sasl_gssapi_krb_plain`, `sasl_gssapi_krb_signonly`, `sasl_gssapi_krb_signseal` |
+| SASL/DIGEST-MD5 | `sasl_digest_md5_plain`, `sasl_digest_md5_signonly`, `sasl_digest_md5_signseal` |
 
 Each NTLM family tests four security layers: plain, sign-only, seal-only, and sign+seal. Kerberos and DIGEST-MD5 have three: plain, sign-only, and sign+seal - in Kerberos/GSSAPI, the "seal-only" wire state is not defined (`GSS_Wrap` with CONF already implies integrity), and DIGEST-MD5 always combines integrity and confidentiality per RFC 2831.
 
-For Kerberos methods, the AP-REQ subkey etype proposal is controlled by `--propose-subkey` (see below) rather than being a separate method variant. The subkey governs per-message protection per RFC 4121 §2: `aes256-cts-hmac-sha1-96` (default) steers the DC toward an AES256 acceptor subkey; `none` lets the DC pick from its `msDS-SupportedEncryptionTypes` (typically RC4-HMAC on a default-configured DC); `rc4-hmac` and `aes128-cts-hmac-sha1-96` propose those etypes explicitly.
+### About Kerberos
+
+For Kerberos methods, the AP-REQ subkey etype proposal is controlled by `--propose-subkey` (see below) rather than provided in separate method variants. The subkey governs per-message protection per RFC 4121 §2: `aes256-cts-hmac-sha1-96` (default) steers the DC toward an AES256 acceptor subkey; `none` lets the DC pick from its `msDS-SupportedEncryptionTypes` (typically RC4-HMAC on a default-configured DC); `rc4-hmac` and `aes128-cts-hmac-sha1-96` propose those etypes explicitly.
+
+PKINIT is not implemented as it's more related to the KDC than to the LDAP service itself. To test flows related to PKINIT first perform PKINIT manually to obtain a TGT, then test Kerberos-related methods by providing it via `--ccache` or the KRB5CCNAME environment variable.
 
 > [!NOTE]
-> PKINIT is not implemented as it's more related to the KDC than to the LDAP service itself. To test flows related to PKINIT first perform PKINIT manually to obtain a TGT, then test Kerberos-related methods by providing it via `--ccache` or the KRB5CCNAME environment variable.
->
-> When no Kerberos-specific credential (`--ccache`, `--aes-key`, `--keytab`) is supplied but Kerberos methods are selected and a password or NT hash is present, a TGT is obtained in memory from that credential via `getKerberosTGT` - nothing is written to disk.
+> When no Kerberos-specific credential (`--ccache`, `--aes-key`, `--keytab`) is supplied but Kerberos methods are selected and a **password** or **NT hash** is present, a TGT and a ST are obtained in memory from that credential.
+
+### About NTLM "signonly"
+
+It seems a real DC won't perform signing without sealing - even if **only signing was negotiated** (and accepted by the DC) it seems it always expects a sealed payload. That's why all `NTLM` + `signonly` variants always result `PARTIAL` unless `--ntlm-always-seal` is set.
+
+### About GSSAPI and NTLM
+
+For some reason all Microsoft specs (such as `MS-ADTS`) state that their implementation of the SASL/GSSAPI mech (without SPNEGO) is for Kerberos only (which would seem correct per RFC4752), but Microsoft's own clients such as ADExplorer often issue SASL/GSSAPI carrying NTLM, and DCs accept it just fine.
 
 ## Requirements
 
