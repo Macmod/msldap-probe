@@ -290,6 +290,7 @@ def complete_ntlm_handshake(
     creds,
     layer: str,
     gss_wrapped: bool = False,
+    channel_binding_value: bytes = b"",
 ):
     """Runs Type3 construction (reusing impacket's getNTLMSSPType3 as-is -
     it already correctly derives responseFlags as the intersection of what
@@ -323,6 +324,10 @@ def complete_ntlm_handshake(
         nthash,
         service="ldap",
         version=version,
+        # impacket places this in the MsvAvChannelBindings AV_PAIR
+        # (NTLMSSP_AV_CHANNEL_BINDINGS, 0x0a) and recomputes NTProofStr over
+        # the modified TargetInfo, so passing it here is all that is needed.
+        channel_binding_value=channel_binding_value,
     )
     strategy = build_ntlm_layer_strategy(
         layer,

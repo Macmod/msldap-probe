@@ -54,6 +54,25 @@ _COLOR = True
 _DEBUG = False
 
 
+def _hint(name: str, detail: str) -> str:
+    """A short suffix explaining an error whose own text points the wrong way.
+
+    SEC_E_BAD_BINDINGS surfaces as `invalidCredentials ... data 80090346`,
+    which reads as a password problem when the credentials were fine and the
+    channel binding was the issue.
+    """
+    if "80090346" not in detail:
+        return ""
+    if "digest_md5" in name:
+        # RFC 2831 has no field for a channel binding, so --channel-bindings
+        # cannot help here - the method simply cannot satisfy a DC that
+        # requires one.
+        note = " (bad bindings, DIGEST-MD5 cannot carry one)"
+    else:
+        note = " (bad bindings, retry with --channel-bindings)"
+    return _paint(note, "yellow", _COLOR)
+
+
 def _truncate(detail: str, limit: int = 300) -> str:
     if _DEBUG or len(detail) <= limit:
         return detail
@@ -138,6 +157,17 @@ def parse_args() -> argparse.Namespace:
         "offer the requested cipher. Ignored by every other method.",
     )
     p.add_argument(
+        "--channel-bindings",
+        action="store_true",
+        help="Send an RFC 5929 'tls-server-end-point' channel binding with NTLM "
+        "and Kerberos SASL binds, tying the authentication to the server's TLS "
+        "certificate. Only meaningful under --scheme starttls or ldaps; on a "
+        "plaintext connection there is no channel to bind and the token is "
+        "omitted. Required by a DC with LdapEnforceChannelBinding=2, and "
+        "validated by one set to 1. Simple binds, SASL EXTERNAL and DIGEST-MD5 "
+        "have nowhere to carry a binding and are unaffected.",
+    )
+    p.add_argument(
         "--ntlm-always-seal",
         action="store_true",
         help="Encrypt outgoing NTLM traffic even when only NTLMSSP_NEGOTIATE_SIGN "
@@ -211,6 +241,7 @@ def build_credentials(args: argparse.Namespace) -> Credentials:
         cksum_flags=args.cksum_flags,
         ntlm_always_seal=args.ntlm_always_seal,
         digest_md5_cipher=args.digest_md5_cipher,
+        channel_bindings=args.channel_bindings,
         scheme=args.scheme,
     )
 
@@ -336,7 +367,7 @@ def main() -> int:
         if status in ("FAIL", "PARTIAL") and not _DEBUG:
             print(f"{status_text} {name:36}")
         else:
-            print(f"{status_text} {name:36} {_truncate(detail)}")
+            print(f"{status_text} {name:36} {_truncate(detail)}{_hint(name, detail)}")
 
     failed = sum(1 for _, status, _ in results if status == "FAIL")
     partial = sum(1 for _, status, _ in results if status == "PARTIAL")

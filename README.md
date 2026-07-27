@@ -60,6 +60,20 @@ A DC accepts a `NTLMSSP_NEGOTIATE_SIGN`-without-`SEAL` bind, but still expects e
 
 By default this tool sends what the negotiated flags actually describe, so the wire matches the method name. Against a DC that means every `*_ntlm_signonly` method reports `PARTIAL`, with the server's own explanation as the detail. Pass `--ntlm-always-seal` to seal the sign-only case too, which is what a DC requires and what makes those methods `PASS`.
 
+### About channel bindings
+
+`--channel-bindings` makes NTLM and Kerberos SASL binds carry an RFC 5929 `tls-server-end-point` token, tying the authentication to the TLS certificate the connection runs on. It is what a DC with `LdapEnforceChannelBinding=1` validates and what one set to `2` requires. It only does anything under `-s ldaps` or `-s starttls` - on a plaintext connection there is no channel to bind, so the token is omitted and the flag is a no-op.
+
+`-m plain` is the natural selection for testing it: no SASL security layer can be in effect over TLS anyway (see the note under LDAPS/StartTLS below), and the plain layer covers both authentication families across all three carriers plus DIGEST-MD5.
+
+```bash
+python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -m plain -s ldaps --channel-bindings
+```
+
+Against a DC set to `2`, omitting the flag fails every method with `data 80090346` (`SEC_E_BAD_BINDINGS`), which is reported as `invalidCredentials` even though the credentials were fine - so the output appends a short hint saying so. Adding the flag makes the NTLM and Kerberos methods pass.
+
+`sasl_digest_md5_plain` fails either way, and cannot be made to pass: RFC 2831 predates channel bindings and has no field to carry one, so DIGEST-MD5 is unusable over TLS against a DC that requires them. Simple binds and SASL EXTERNAL are unaffected - neither is a SASL mechanism that carries a binding.
+
 ### About DIGEST-MD5 ciphers
 
 `auth-conf` negotiates a cipher of its own. AD may offer `3des,rc4`; `rc4` is the default and `--digest-md5-cipher` selects another. `des`, `rc4-40` and `rc4-56` are implemented and accepted by the flag - if AD does not offer them, requesting one fails the bind up front and reports the list the server did offer.
@@ -156,38 +170,39 @@ python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -s 
 
 **Target and transport**
 
-- `-t`, `--target` — target host or IP (required).
-- `-P`, `--port` — override the default port for the chosen scheme.
-- `-s`, `--scheme` — transport: `ldap` (default), `starttls`, or `ldaps`.
+- `-t`, `--target` - target host or IP (required).
+- `-P`, `--port` - override the default port for the chosen scheme.
+- `-s`, `--scheme` - transport: `ldap` (default), `starttls`, or `ldaps`.
 
 **Credentials**
 
-- `-d`, `--domain` — domain FQDN or NetBIOS name.
-- `-u`, `--username` — username.
-- `-p`, `--password` — password.
-- `-H`, `--hashes` — `LM:NT` hash pair.
-- `-A`, `--aes-key` — AES key for Kerberos (AES256 or AES128).
-- `--ccache` — path to a Kerberos credentials cache. Overrides `KRB5CCNAME`. When set, no TGT is requested from the KDC: the cached service ticket is used directly, or a cached TGT is used to obtain one.
-- `-C`, `--cert-pem` — client certificate PEM for `sasl_external`.
-- `-k`, `--key-pem` — client private key PEM for `sasl_external`.
+- `-d`, `--domain` - domain FQDN or NetBIOS name.
+- `-u`, `--username` - username.
+- `-p`, `--password` - password.
+- `-H`, `--hashes` - `LM:NT` hash pair.
+- `-A`, `--aes-key` - AES key for Kerberos (AES256 or AES128).
+- `--ccache` - path to a Kerberos credentials cache. Overrides `KRB5CCNAME`. When set, no TGT is requested from the KDC: the cached service ticket is used directly, or a cached TGT is used to obtain one.
+- `-C`, `--cert-pem` - client certificate PEM for `sasl_external`.
+- `-k`, `--key-pem` - client private key PEM for `sasl_external`.
 
 **Kerberos tuning** (ignored by other methods)
 
-- `-K`, `--kdc-host` — KDC hostname/IP (defaults to `--domain`).
-- `-S`, `--spn-host` — real hostname for the `ldap/<host>` SPN when `--target` is an IP.
-- `--propose-subkey` — AP-REQ subkey etype: `none` (DC picks), `rc4-hmac`, `aes128-cts-hmac-sha1-96`, or `aes256-cts-hmac-sha1-96` (default).
-- `--cksum-flags` — override the AP-REQ GSS-API checksum flags (int bitmask of `GSS_C_INTEG_FLAG` 0x20 and `GSS_C_CONF_FLAG` 0x10, RFC 4121 §4.1.1.1). Default: 0x03 for GSSAPI, derived from the bind's layer for SPNEGO.
+- `-K`, `--kdc-host` - KDC hostname/IP (defaults to `--domain`).
+- `-S`, `--spn-host` - real hostname for the `ldap/<host>` SPN when `--target` is an IP.
+- `--propose-subkey` - AP-REQ subkey etype: `none` (DC picks), `rc4-hmac`, `aes128-cts-hmac-sha1-96`, or `aes256-cts-hmac-sha1-96` (default).
+- `--cksum-flags` - override the AP-REQ GSS-API checksum flags (int bitmask of `GSS_C_INTEG_FLAG` 0x20 and `GSS_C_CONF_FLAG` 0x10, RFC 4121 §4.1.1.1). Default: 0x03 for GSSAPI, derived from the bind's layer for SPNEGO.
 
-**Security-layer tuning**
+**SASL behaviour**
 
-- `--ntlm-always-seal` — seal outgoing NTLM traffic even when only `NTLMSSP_NEGOTIATE_SIGN` was negotiated. Off by default; required for the `*_ntlm_signonly` methods to pass against a DC (see [About NTLM "signonly"](#about-ntlm-signonly)).
-- `--digest-md5-cipher` — cipher to propose for a DIGEST-MD5 `auth-conf` bind: `rc4` (default), `rc4-40`, `rc4-56`, `des`, or `3des`.
+- `--channel-bindings` - send an RFC 5929 `tls-server-end-point` binding with NTLM and Kerberos binds. Only meaningful under `-s ldaps`/`-s starttls`; required by a DC with `LdapEnforceChannelBinding=2` (see [About channel bindings](#about-channel-bindings)).
+- `--ntlm-always-seal` - seal outgoing NTLM traffic even when only `NTLMSSP_NEGOTIATE_SIGN` was negotiated. Off by default; required for the `*_ntlm_signonly` methods to pass against a DC (see [About NTLM "signonly"](#about-ntlm-signonly)).
+- `--digest-md5-cipher` - cipher to propose for a DIGEST-MD5 `auth-conf` bind: `rc4` (default), `rc4-40`, `rc4-56`, `des`, or `3des`.
 
 **Selection and output**
 
-- `-m`, `--methods` — comma-separated method names, prefixes or aliases, or `all` (the default).
-- `-D`, `--debug` — show full error details.
-- `-Z`, `--no-color` — disable colored output.
+- `-m`, `--methods` - comma-separated method names, prefixes or aliases, or `all` (the default).
+- `-D`, `--debug` - show full error details.
+- `-Z`, `--no-color` - disable colored output.
 
 ### Selecting methods
 

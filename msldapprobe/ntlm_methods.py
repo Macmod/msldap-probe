@@ -30,6 +30,12 @@ from .transport import LDAPTransport, open_transport
 NTLM_MECH_OID = TypesMech["NTLMSSP - Microsoft NTLM Security Support Provider"]
 
 
+def _cbt(transport: LDAPTransport, creds: Credentials) -> bytes:
+    """The RFC 5929 channel binding for this connection, or b"" when
+    --channel-bindings is off or the connection is not running over TLS."""
+    return transport.channel_binding_token() if creds.channel_bindings else b""
+
+
 def _bind_result_code(protocol_op) -> ResultCode:
     return protocol_op["bindResponse"]["resultCode"]
 
@@ -70,7 +76,9 @@ def _bind_sicily(
     type2_bytes = resp["bindResponse"]["matchedDN"].asOctets()
 
     # Round 3: response (Type3).
-    type3, strategy, _ = complete_ntlm_handshake(type1, type2_bytes, creds, layer)
+    type3, strategy, _ = complete_ntlm_handshake(
+        type1, type2_bytes, creds, layer, channel_binding_value=_cbt(transport, creds)
+    )
     response = BindRequest()
     response["version"] = 3
     response["name"] = creds.username
@@ -154,7 +162,7 @@ def _bind_spnego_ntlm(
     type2_bytes = resp_blob["ResponseToken"]
 
     type3, strategy, exported_session_key = complete_ntlm_handshake(
-        type1, type2_bytes, creds, layer, gss_wrapped=True
+        type1, type2_bytes, creds, layer, gss_wrapped=True, channel_binding_value=_cbt(transport, creds)
     )
 
     # MIC over [Type1 || Type2 || Type3] binds the three messages together
@@ -289,7 +297,7 @@ def _bind_gssapi_ntlm(
     )
 
     type3, strategy, exported_session_key = complete_ntlm_handshake(
-        type1, type2_bytes, creds, layer, gss_wrapped=True
+        type1, type2_bytes, creds, layer, gss_wrapped=True, channel_binding_value=_cbt(transport, creds)
     )
     mic = hmac_md5(
         exported_session_key,

@@ -73,6 +73,13 @@ class Credentials:
     # offer it. Ignored by every other method, including the other two
     # DIGEST-MD5 QOP levels, which seal nothing.
     digest_md5_cipher: str = "rc4"
+    # Whether a SASL bind should carry an RFC 5929 `tls-server-end-point`
+    # channel binding, tying the authentication to the TLS certificate the
+    # connection is running on. Only meaningful under --scheme starttls or
+    # ldaps; on a plaintext connection there is no channel to bind and the
+    # token is omitted regardless. NTLM and Kerberos carry it; simple binds,
+    # SASL EXTERNAL and DIGEST-MD5 have nowhere to put one.
+    channel_bindings: bool = False
 
     def __post_init__(self) -> None:
         if not self.spn_host:

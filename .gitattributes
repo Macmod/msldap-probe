@@ -1,0 +1,5 @@
+# Store LF in the repository and check out LF, on every platform and no
+# matter what wrote the file. Without this, an editor or a script that
+# rewrites a file with CRLF makes every line show as modified in git diff,
+# burying the real change. Files detected as binary are left untouched.
+* text=auto eol=lf

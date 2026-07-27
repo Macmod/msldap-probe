@@ -9,6 +9,7 @@ bind builders and LayerStrategy-based wrap/unwrap.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import socket
 import struct
 from typing import Optional
@@ -139,6 +140,46 @@ class LDAPTransport(LDAPConnection):
         # hands it over whole, prefix included - only the wrapped body
         # after those 4 bytes needs unwrapping.
         return self.layer_strategy.unwrap(data[4:])
+
+    def channel_binding_token(self) -> bytes:
+        """The `tls-server-end-point` channel binding for this connection, or
+        b"" when it isn't running over TLS.
+
+        RFC 5929 §4 hashes the server certificate with the hash its own
+        signature algorithm uses, except that MD5 and SHA-1 are upgraded to
+        SHA-256. That digest becomes the `application_data` of a GSS
+        channel-bindings structure (RFC 2744 §3.11, all address fields empty),
+        and callers embed the MD5 of that structure - NTLM in an
+        `MsvAvChannelBindings` AV_PAIR, Kerberos in the AP-REQ checksum's
+        `Bnd` field. Both mechanisms carry the same value.
+        """
+        get_peer = getattr(self._socket, "get_peer_certificate", None)
+        if get_peer is None:
+            return b""  # plain socket: no channel to bind to
+        cert = get_peer()
+        if cert is None:
+            return b""
+
+        # The certificate's own signature algorithm picks the hash, e.g.
+        # "sha256WithRSAEncryption" -> sha256.
+        sig_alg = cert.get_signature_algorithm().decode("ascii", "replace").lower()
+        for name in ("sha512", "sha384", "sha256"):
+            if name in sig_alg:
+                digest_name = name
+                break
+        else:
+            digest_name = "sha256"  # RFC 5929 §4.1: md5/sha1 are upgraded
+
+        from OpenSSL import crypto
+
+        der = crypto.dump_certificate(crypto.FILETYPE_ASN1, cert)
+        cert_hash = hashlib.new(digest_name, der).digest()
+        application_data = b"tls-server-end-point:" + cert_hash
+
+        # gss_channel_bindings_struct with no addresses: five little-endian
+        # 32-bit fields, then application_data.
+        bindings = struct.pack("<IIIII", 0, 0, 0, 0, len(application_data))
+        return hashlib.md5(bindings + application_data).digest()
 
     _NON_TERMINAL_OPS = ("searchResEntry", "searchResRef")
     # RFC 4511 §4.4.1 Notice of Disconnection.

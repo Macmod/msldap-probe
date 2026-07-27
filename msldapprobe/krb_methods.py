@@ -47,6 +47,12 @@ from .transport import LDAPTransport, open_transport
 KRB5_MECH_OID = TypesMech["MS KRB5 - Microsoft Kerberos 5"]
 
 
+def _cbt(transport, creds) -> bytes:
+    """The RFC 5929 channel binding for this connection, or b"" when
+    --channel-bindings is off or the connection is not running over TLS."""
+    return transport.channel_binding_token() if creds.channel_bindings else b""
+
+
 def _bind_result_code(protocol_op) -> ResultCode:
     return protocol_op["bindResponse"]["resultCode"]
 
@@ -94,6 +100,7 @@ def _bind_spnego_krb(
         session_key,
         creds,
         ck_flags,
+        channel_binding_value=_cbt(transport, creds),
         propose_subkey=creds.propose_subkey,
     )
     blob = SPNEGO_NegTokenInit()
@@ -209,6 +216,7 @@ def _bind_gssapi_krb(
         session_key,
         creds,
         ck_flags,
+        channel_binding_value=_cbt(transport, creds),
         mutual_required=True,
         propose_subkey=creds.propose_subkey,
     )
