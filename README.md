@@ -1,4 +1,13 @@
-# msldap-probe
+<p align="center">
+  <h1 align="center"><b>msldap-probe</b></h1>
+  <p align="center"><i>Probe all authentication methods against MSLDAP services for troubleshooting/research/study purposes.</i></p>
+  <p align="center">
+    <img src="https://img.shields.io/github/languages/code-size/Macmod/msldap-probe" alt="">
+    <img src="https://img.shields.io/github/license/Macmod/msldap-probe" alt="">
+    <img src="https://img.shields.io/github/downloads/Macmod/msldap-probe/total" alt="GitHub Downloads">
+    <a href="https://twitter.com/MacmodSec"><img src="https://img.shields.io/twitter/follow/MacmodSec?style=for-the-badge&logo=X&color=blue" alt="Twitter Follow"></a>
+  </p>
+</p>
 
 LDAP/AD authentication-method matrix tester.
 
@@ -206,3 +215,27 @@ FAIL/PARTIAL details are hidden unless `--debug` is used, to keep the default ou
 - The receive path reads one SASL frame at a time and coalesces frames until a response is complete, so a reply spanning several frames is handled. It also accepts an unwrapped `LDAPMessage` mid-connection, which is how a DC delivers a Notice of Disconnection while tearing a session down - that server-side explanation is surfaced verbatim instead of appearing as a connection reset.
 - Kerberos methods require a resolvable SPN. If `--target` is an IP, use `--spn-host` to supply the real hostname for `ldap/<spn-host>`.
 - `sasl_external` does not require credentials; it reports what the server does when an EXTERNAL bind is attempted with or without a TLS client certificate.
+
+## License
+
+MIT License
+
+Copyright (c) 2026 Artur Henrique Marzano Gonzaga
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
