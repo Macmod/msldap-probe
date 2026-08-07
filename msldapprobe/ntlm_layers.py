@@ -336,11 +336,16 @@ class NTLMLayerStrategy:
 def _looks_like_cleartext_ldap(payload: bytes) -> bool:
     """Whether payload is an unencrypted LDAPMessage rather than ciphertext.
 
-    Checking only for a leading 0x30 would misfire on roughly 1 in 256 sealed
-    bodies, and a single misfire desynchronises the RC4 stream for the rest of
-    the connection. So the BER length header is decoded as well and required
-    to account for the payload exactly (a single message) or to fit inside it
-    (a bundle) - which random ciphertext will essentially never satisfy.
+    A sealed body is indistinguishable from random bytes, so the answer has to
+    come from structure alone, and one wrong answer desynchronises the RC4
+    stream for the rest of the connection. Three things are therefore required
+    together, each cutting the odds of a sealed body passing by chance:
+
+    - the universal SEQUENCE tag every LDAPMessage opens with;
+    - a BER length accounting for the payload exactly (a single message) or
+      fitting inside it (a bundle);
+    - the messageID that RFC 4511 §4.1.1 places first inside that SEQUENCE,
+      which narrows the byte after the header to a single tag value.
     """
     if len(payload) < 2 or payload[0] != 0x30:
         return False
@@ -352,7 +357,15 @@ def _looks_like_cleartext_ldap(payload: bytes) -> bool:
         if count == 0 or count > 4 or len(payload) < 2 + count:
             return False
         total, body_len = 2 + count, int.from_bytes(payload[2 : 2 + count], "big")
-    return total + body_len <= len(payload)
+    if total + body_len > len(payload):
+        return False
+    # messageID is a universal INTEGER, and RFC 4511 §4.1.1 bounds it by maxInt
+    # (2^31 - 1), so its contents occupy five octets at most - four, plus a
+    # possible leading zero keeping the sign bit clear.
+    if len(payload) < total + 2 or payload[total] != 0x02:
+        return False
+    id_len = payload[total + 1]
+    return 1 <= id_len <= 5 and 2 + id_len <= body_len
 
 
 def _legacy_seal_key(flags: int, exported_session_key: bytes) -> bytes:
