@@ -4,7 +4,6 @@
   <p align="center">
     <img src="https://img.shields.io/github/languages/code-size/Macmod/msldap-probe" alt="">
     <img src="https://img.shields.io/github/license/Macmod/msldap-probe" alt="">
-    <img src="https://img.shields.io/github/downloads/Macmod/msldap-probe/total" alt="GitHub Downloads">
     <a href="https://twitter.com/MacmodSec"><img src="https://img.shields.io/twitter/follow/MacmodSec?style=for-the-badge&logo=X&color=blue" alt="Twitter Follow"></a>
   </p>
 </p>
