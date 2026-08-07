@@ -80,6 +80,40 @@ class Credentials:
     # token is omitted regardless. NTLM and Kerberos carry it; simple binds,
     # SASL EXTERNAL and DIGEST-MD5 have nowhere to put one.
     channel_bindings: bool = False
+    # Whether the AUTHENTICATE_MESSAGE should declare its MIC through
+    # MsvAvFlags bit 0x2. Every NTLM method populates the MIC field either
+    # way; this decides only whether the client says so, which per MS-NLMP
+    # §3.1.5.1.2 is what a client supplying a MIC is required to do and what
+    # gives a server reason to verify it. Off by default, which is what
+    # impacket does - it populates the field and never sets the bit.
+    # Ignored by non-NTLM methods.
+    announce_mic: bool = False
+    # Whether NTLM methods compute an NTLMv1 response instead of NTLMv2.
+    # NTLMv1's NtChallengeResponse is 24 bytes of DES output with no AV_PAIR
+    # list, so everything carried in that list is unavailable: channel
+    # bindings (MsvAvChannelBindings) and the MIC declaration (MsvAvFlags)
+    # both have nowhere to go, and impacket's computeResponseNTLMv1 does not
+    # even accept a channel binding argument. Modern Active Directory
+    # refuses NTLMv1 outright unless the LAN Manager authentication level
+    # has been lowered. Ignored by non-NTLM methods.
+    ntlmv1: bool = False
+    # Whether an NTLMv1 bind suppresses extended session security. Off, so
+    # --ntlmv1 negotiates ESS. Setting it puts the legacy signing and sealing
+    # regime on the wire instead: SIGNKEY yields no key, the signature is the
+    # MS-NLMP §3.4.4.1 form, and one sealing key serves both directions
+    # half-duplex.
+    no_ess: bool = False
+    # What NTLM methods put in the AUTHENTICATE_MESSAGE MIC field:
+    # "computed" is the HMAC-MD5 of the three messages, "empty" is the field
+    # present and all zero, "drop" is no field at all. Independent of
+    # announce_mic, which decides only whether a populated field is declared.
+    #
+    # Dropping it also drops the Version field. MS-NLMP §2.2.1.3 places
+    # Version and then MIC between the fixed header and the payload and gives
+    # neither a presence flag, so a receiver takes both to be there exactly
+    # when NTLMSSP_NEGOTIATE_VERSION is set and they have to be emitted or
+    # omitted together. Ignored by non-NTLM methods.
+    mic: str = "computed"
 
     def __post_init__(self) -> None:
         if not self.spn_host:

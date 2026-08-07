@@ -60,6 +60,30 @@ A DC accepts a `NTLMSSP_NEGOTIATE_SIGN`-without-`SEAL` bind, but still expects e
 
 By default this tool sends what the negotiated flags actually describe, so the wire matches the method name. Against a DC that means every `*_ntlm_signonly` method reports `PARTIAL`, with the server's own explanation as the detail. Pass `--ntlm-always-seal` to seal the sign-only case too, which is what a DC requires and what makes those methods `PASS`.
 
+### About NTLMv1
+
+`--ntlmv1` computes an NTLMv1 response instead of NTLMv2, for targets whose LAN Manager authentication level still permits it.
+
+NTLMv1 carries no `AV_PAIR` list, so channel bindings and the MIC declaration would have nowhere to go - `--channel-bindings` and `--announce-mic` are not accepted if `--ntlmv1` is enabled.
+
+`--ntlmv1` negotiates extended session security. If `--no-ess` is passed it is suppressed and the legacy signing and sealing regime is used instead. The key exchange is NT-keyed: no option requests the legacy LM-keyed branches.
+
+Under `--no-ess`, `sasl_gssapi_ntlm_sealonly` and `sasl_spnego_ntlm_sealonly` reuse one RC4 keystream for every message, so their sealing provides no meaningful confidentiality.
+
+The legacy regime also shares one sequence number between the two directions, as it shares the sealing key: a reply advances the number the next request carries. Extended session security numbers each direction separately.
+
+### About the MIC
+
+`--mic` selects what the Type 3 MIC field carries: `computed` (the default), `empty` for a field present but all zero, or `drop` for no field at all. `--announce-mic` is separate and decides only whether a populated field is *declared*.
+
+**Presence is tied to the Version field.** MS-NLMP §2.2.1.3 lays the `AUTHENTICATE_MESSAGE` out as a fixed 64-byte header, then Version, then MIC, then the payload, and gives neither Version nor MIC a presence flag of its own. A receiver takes both to be present exactly when `NTLMSSP_NEGOTIATE_VERSION` is set, so it seems the two have to be emitted or omitted together - which is why `drop` also drops Version and that flag. 
+
+**An undeclared MIC is not checked.** `computed` and `empty` are both accepted, so by default the field is structural only and provides no integrity protection. `--announce-mic` declares it through `MsvAvFlags` bit 0x2, which MS-NLMP §3.1.5.1.2 requires of a client supplying one. The declaration lands in the NTLMv2 blob before `NTProofStr` covers it, so the MIC becomes one the server is told to check - and then the value matters. On its own, `--announce-mic` declares the computed MIC and a DC accepts it. `--mic empty --announce-mic` declares a field left all zero, and a DC rejects it with `data 57` - which is what shows the value is genuinely verified once declared, rather than merely required to be present.
+
+A declared MIC is only validated when `NTLMSSP_NEGOTIATE_ALWAYS_SIGN` was negotiated. Without it a DC answers `data 57` however correct the MIC is, and neither the key exchange nor the security layer makes any difference. Every method here negotiates that flag, including the `*_ntlm_plain` ones: MS-NLMP §2.2.2.5 has it request a signature block without negotiating session security, which is why it does not turn `plain` into a signed method - a Windows client sets it in every `NEGOTIATE_MESSAGE` regardless of the layer it goes on to use.
+
+**A declaration with no field behind it is refused.** `--mic drop --announce-mic` sends a blob declaring a MIC in a message that carries none, and a DC rejects all twelve methods with `data 57`; `--mic drop` on its own passes all twelve, so the declaration bit is the only difference and the DC is enforcing presence rather than reacting to the missing field. That pairing is not merely a misconfiguration: `MsvAvFlags` lives inside the blob that `NTProofStr` covers, so a declaration cannot be withdrawn once the response is computed, and stripping the MIC field while the declaration stands is reachable without the client's cooperation. A server that accepted it would be honouring a declaration it never checked.
+
 ### About channel bindings
 
 `--channel-bindings` makes NTLM and Kerberos SASL binds carry an RFC 5929 `tls-server-end-point` token, tying the authentication to the TLS certificate the connection runs on. It is what a DC with `LdapEnforceChannelBinding=1` validates and what one set to `2` requires. It only does anything under `-s ldaps` or `-s starttls` - on a plaintext connection there is no channel to bind, so the token is omitted and the flag is a no-op.
@@ -197,6 +221,13 @@ python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -s 
 - `--channel-bindings` - send an RFC 5929 `tls-server-end-point` binding with NTLM and Kerberos binds. Only meaningful under `-s ldaps`/`-s starttls`; required by a DC with `LdapEnforceChannelBinding=2` (see [About channel bindings](#about-channel-bindings)).
 - `--ntlm-always-seal` - seal outgoing NTLM traffic even when only `NTLMSSP_NEGOTIATE_SIGN` was negotiated. Off by default; required for the `*_ntlm_signonly` methods to pass against a DC (see [About NTLM "signonly"](#about-ntlm-signonly)).
 - `--digest-md5-cipher` - cipher to propose for a DIGEST-MD5 `auth-conf` bind: `rc4` (default), `rc4-40`, `rc4-56`, `des`, or `3des`.
+
+**NTLM behaviour**
+
+- `--ntlmv1` - compute an NTLMv1 response instead of NTLMv2, negotiating extended session security (see [About NTLMv1](#about-ntlmv1)).
+- `--no-ess` - suppress extended session security, putting the legacy regime on the wire. Requires `--ntlmv1`.
+- `--announce-mic` - declare the Type 3 MIC through `MsvAvFlags` bit 0x2, so a server verifies it (see [About the MIC](#about-the-authenticate_message-mic)).
+- `--mic` - what the Type 3 MIC field carries: `computed` (default), `empty` (present, all zero), or `drop` (omitted, along with the Version field).
 
 **Selection and output**
 

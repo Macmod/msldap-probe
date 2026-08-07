@@ -173,10 +173,50 @@ def parse_args() -> argparse.Namespace:
         help="Encrypt outgoing NTLM traffic even when only NTLMSSP_NEGOTIATE_SIGN "
         "was negotiated. Off by default, so the *_ntlm_signonly methods put a "
         "signed cleartext body on the wire, exactly as the negotiated flags "
-        "describe. Active Directory rejects that - it unseals every post-bind "
-        "body once any security layer is active and answers a cleartext one "
-        "with 'Error decrypting ldap message' - so this must be set for "
-        "sign-only to complete against a DC. Ignored by non-NTLM methods.",
+        "describe. Ignored by non-NTLM methods.",
+    )
+    p.add_argument(
+        "--ntlmv1",
+        action="store_true",
+        help="Compute an NTLMv1 response instead of NTLMv2 for the NTLM methods. "
+        "NTLMv1's NtChallengeResponse is 24 bytes of DES output carrying no AV_PAIR "
+        "list, so it cannot convey channel bindings or a MIC declaration, and "
+        "--channel-bindings and --announce-mic are rejected alongside it rather than "
+        "being silently dropped. Modern Active Directory refuses NTLMv1 unless the "
+        "LAN Manager authentication level has been lowered. Ignored by non-NTLM "
+        "methods.",
+    )
+    p.add_argument(
+        "--no-ess",
+        action="store_true",
+        help="Suppress extended session security on an NTLMv1 bind, putting the "
+        "legacy signing and sealing regime on the wire: no signing key, the "
+        "MS-NLMP §3.4.4.1 signature, and one sealing key shared half-duplex by "
+        "both directions. Requires --ntlmv1.",
+    )
+    p.add_argument(
+        "--announce-mic",
+        action="store_true",
+        help="Declare the AUTHENTICATE_MESSAGE's MIC through MsvAvFlags bit 0x2, as "
+        "MS-NLMP §3.1.5.1.2 requires of a client supplying one. Every NTLM method "
+        "populates the MIC field either way; without this nothing says so - which is "
+        "what impacket does - and a server has no reason to verify it. With it, the "
+        "declaration is placed in the NTLMv2 blob before NTProofStr covers it, so the "
+        "MIC becomes one the server is told to check. Ignored by non-NTLM methods.",
+    )
+    p.add_argument(
+        "--mic",
+        choices=["computed", "empty", "drop"],
+        default="computed",
+        help="What to put in the AUTHENTICATE_MESSAGE's MIC field. 'computed' "
+        "(default) is the HMAC-MD5 over the three messages that MS-NLMP §3.1.5.1.2 "
+        "defines, matching impacket's own 'sasl' bind path; 'empty' leaves the field "
+        "present and all zero; 'drop' omits it, which also omits the Version field "
+        "and NTLMSSP_NEGOTIATE_VERSION, since §2.2.1.3 places Version and then MIC "
+        "between the fixed header and the payload and gives neither a presence flag "
+        "of its own, so the two are emitted or omitted together. Independent of "
+        "--announce-mic, which only decides whether the field is declared. "
+        "Ignored by non-NTLM methods.",
     )
     p.add_argument(
         "-C", "--cert-pem", default=None, help="Client certificate PEM (sasl_external)"
@@ -215,6 +255,33 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_credentials(args: argparse.Namespace) -> Credentials:
+    # Both of these live in the NTLMv2 response's AV_PAIR list, which an
+    # NTLMv1 response does not have - impacket's computeResponseNTLMv1 takes
+    # no channel binding argument at all. Combining them would produce a bind
+    # silently missing whatever was asked for, so refuse instead.
+    if getattr(args, "ntlmv1", False):
+        conflicting = [
+            name
+            for name, flag in (
+                ("--channel-bindings", args.channel_bindings),
+                ("--announce-mic", args.announce_mic),
+            )
+            if flag
+        ]
+        if conflicting:
+            raise SystemExit(
+                f"--ntlmv1 cannot be combined with {', '.join(conflicting)}: an "
+                "NTLMv1 response carries no AV_PAIR list to put them in"
+            )
+    else:
+        # KXKEY returns SessionBaseKey immediately for NTLMv2, so the setting
+        # would not reach the wire in a form that changes anything.
+        for name, given in (
+            ("--no-ess", getattr(args, "no_ess", False)),
+        ):
+            if given:
+                raise SystemExit(f"{name} requires --ntlmv1")
+
     lmhash, nthash = b"", b""
     if args.hashes:
         if ":" in args.hashes:
@@ -240,6 +307,10 @@ def build_credentials(args: argparse.Namespace) -> Credentials:
         propose_subkey=args.propose_subkey,
         cksum_flags=args.cksum_flags,
         ntlm_always_seal=args.ntlm_always_seal,
+        ntlmv1=args.ntlmv1,
+        no_ess=args.no_ess,
+        announce_mic=args.announce_mic,
+        mic=args.mic,
         digest_md5_cipher=args.digest_md5_cipher,
         channel_bindings=args.channel_bindings,
         scheme=args.scheme,

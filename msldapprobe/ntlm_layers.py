@@ -18,25 +18,30 @@ from typing import Optional
 
 from Cryptodome.Cipher import ARC4
 from impacket.ntlm import (
+    AV_PAIRS,
+    NTLMAuthChallenge,
     NTLMAuthNegotiate,
     NTLMSSP_NEGOTIATE_128,
     NTLMSSP_NEGOTIATE_56,
     NTLMSSP_NEGOTIATE_ALWAYS_SIGN,
+    NTLMSSP_NEGOTIATE_DATAGRAM,
     NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY,
     NTLMSSP_NEGOTIATE_KEY_EXCH,
+    NTLMSSP_NEGOTIATE_LM_KEY,
     NTLMSSP_NEGOTIATE_NTLM,
     NTLMSSP_NEGOTIATE_SEAL,
     NTLMSSP_NEGOTIATE_SIGN,
     NTLMSSP_NEGOTIATE_TARGET_INFO,
     NTLMSSP_NEGOTIATE_UNICODE,
     NTLMSSP_NEGOTIATE_VERSION,
+    NTLMSSP_REQUEST_NON_NT_SESSION_KEY,
     NTLMSSP_REQUEST_TARGET,
-    SEAL,
+    MAC,
     SEALKEY,
-    SIGN,
     SIGNKEY,
     VERSION,
     getNTLMSSPType3,
+    hmac_md5,
 )
 
 NTLM_BASE_FLAGS = (
@@ -53,8 +58,15 @@ NTLM_BASE_FLAGS = (
 # requests confidentiality without integrity (SEAL but not SIGN/ALWAYS_SIGN)
 # - not how a real Windows client negotiates, but a legitimate edge case for
 # checking how strictly a target enforces flag consistency.
+#
+# plain carries NTLMSSP_NEGOTIATE_ALWAYS_SIGN, which requests a signature
+# block without negotiating session security (MS-NLMP §2.2.2.5); a Windows
+# client sets it in every NEGOTIATE_MESSAGE. Neither SIGN nor SEAL is set, so
+# no security layer becomes active and the connection stays in the clear.
+# Active Directory does not validate a declared AUTHENTICATE_MESSAGE MIC
+# unless it is negotiated.
 LAYER_FLAGS = {
-    "plain": 0,
+    "plain": NTLMSSP_NEGOTIATE_ALWAYS_SIGN,
     "signonly": NTLMSSP_NEGOTIATE_SIGN
     | NTLMSSP_NEGOTIATE_ALWAYS_SIGN
     | NTLMSSP_NEGOTIATE_KEY_EXCH,
@@ -66,20 +78,49 @@ LAYER_FLAGS = {
 }
 
 
-def build_type1(domain: str, layer: str, with_mic: bool = False) -> NTLMAuthNegotiate:
-    """with_mic must be True for any caller that will set type3['MIC']
-    afterward (sasl_spnego_ntlm_*, sasl_gssapi_ntlm_*): impacket's
-    NTLMAuthChallengeResponse.checkMIC only reserves the MIC field's 16
-    bytes in its offset layout when NTLMSSP_NEGOTIATE_VERSION is set on the
-    message's own flags (confirmed by reading its source) - setting
-    type3['MIC'] without this flag silently produces a structurally
-    misaligned message the DC rejects with AcceptSecurityContext error
-    "data 57" (ERROR_INVALID_PARAMETER), not a credentials problem. Sicily
-    never sets a MIC, so its own build_type1 call leaves this off."""
+
+
+def kxkey_branch(challenge_flags: int, ntlmv1: bool) -> str:
+    """Which KXKEY branch (MS-NLMP §3.4.5.1) the challenge's flags select.
+
+    The branch follows the flags the *server* returned rather than the ones
+    the Type 1 asked for, so this reports what was granted. Mirrors
+    impacket's own condition order in KXKEY.
+    """
+    if not ntlmv1:
+        return "v2"
+    if challenge_flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+        return "ess"
+    if challenge_flags & NTLMSSP_NEGOTIATE_LM_KEY:
+        return "lm"
+    if challenge_flags & NTLMSSP_REQUEST_NON_NT_SESSION_KEY:
+        return "nonnt"
+    return "nt"
+
+
+def build_type1(creds, layer: str) -> NTLMAuthNegotiate:
+    """NTLMSSP_NEGOTIATE_VERSION governs the MIC field as well as the Version
+    field. Neither has a presence flag of its own: MS-NLMP §2.2.1.3 lays the
+    AUTHENTICATE_MESSAGE out as a fixed 64-byte header, then Version, then
+    MIC, then the payload, so a receiver takes both to be present exactly when
+    that flag is set. The two therefore have to be emitted or omitted
+    together - a message carrying one without the other places its payload
+    where the receiver does not expect it. Suppressing the flag means
+    clearing os_version as well, since NTLMAuthNegotiate.getData() re-sets it
+    whenever that field is populated."""
+    flags = NTLM_BASE_FLAGS | LAYER_FLAGS[layer]
+    if creds.mic != "drop":
+        flags |= NTLMSSP_NEGOTIATE_VERSION
+    if creds.ntlmv1 and creds.no_ess:
+        # The legacy signing and sealing regime applies only where extended
+        # session security is absent, so reaching it means not negotiating it.
+        flags &= ~NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+
     auth = NTLMAuthNegotiate()
-    auth["flags"] = NTLM_BASE_FLAGS | LAYER_FLAGS[layer]
-    if with_mic:
-        auth["flags"] |= NTLMSSP_NEGOTIATE_VERSION
+    auth["flags"] = flags
+    if creds.mic == "drop":
+        auth["os_version"] = b""
+    else:
         version = VERSION()
         (
             version["ProductMajorVersion"],
@@ -117,18 +158,34 @@ class NTLMLayerStrategy:
        its rejection of a cleartext request. See unwrap().
 
     Separately, SEAL-without-SIGN (`sasl_*_ntlm_sealonly`) uses a different
-    keystream discipline - see `datagram`. A real Windows DC re-keys its RC4
-    sealing per message with the connectionless formula
-    MD5(SealingKey || le32(seqNum)), even over connection-oriented LDAP.
-    MS-NLMP §3.4.3 documents that rekey for connectionless mode only;
-    connection-oriented LDAP is supposed to use one continuous stream, and
-    does for signonly/signseal. No Microsoft spec documents the exception."""
+    keystream discipline - see `datagram`. A real Windows DC reinitialises
+    its RC4 sealing per message there, as MS-NLMP §3.4.3 has it for
+    connectionless mode, even over connection-oriented LDAP; the same flags
+    over signonly/signseal keep the one continuous stream that
+    connection-oriented LDAP calls for. No Microsoft spec documents the
+    exception.
+
+    What the reinitialisation does then depends on extended session
+    security:
+
+    - with it, the key is re-derived per message as
+      MD5(SealingKey || le32(seqNum)), and the signature continues the same
+      handle the body was sealed from;
+    - without it, measured only, the key stays the SealingKey and the
+      signature gets a handle of its own, so body and signature each start
+      that keystream from offset zero.
+
+    The second has no specification behind it in either direction: §3.4.3
+    states that message confidentiality exists in connectionless mode only
+    when extended session security is configured, so it describes no non-ESS
+    form of any of this. Nor is the result something to rely on - one key,
+    restarted per message, means every message reuses one keystream."""
 
     name: str
     flags: int
     negotiated_seal: bool  # NTLMSSP_NEGOTIATE_SEAL bit, as actually negotiated
     seal_out: bool  # whether what we send is encrypted
-    datagram: bool  # per-message MD5(SealKey||seq) rekey (SEAL without SIGN); else continuous RC4
+    datagram: bool  # per-message RC4 reinitialisation (SEAL without SIGN); else continuous RC4
     client_sign_key: bytes
     client_seal_key: bytes  # base sealing key, client->server
     server_sign_key: bytes
@@ -143,38 +200,72 @@ class NTLMLayerStrategy:
     # None until then. See unwrap() for why this is detected, and why it is
     # decided once rather than per message.
     seal_in: Optional[bool] = None
+    # Which KXKEY branch the server's flags selected, for reporting.
+    # See kxkey_branch().
+    kxkey: str = ""
+
+    def _shares_sequence(self) -> bool:
+        """Whether one sequence number serves both directions.
+
+        MS-NLMP §3.4 gives a session without extended session security a
+        single sealing key used half-duplex, and the sequence number goes with
+        it: Samba's legacy path keeps one seq_num alongside the one seal state
+        for both directions (auth/ntlmssp/ntlmssp_sign.c), so a reply advances
+        the number the next request carries. Extended session security numbers
+        each direction separately, and datagram mode numbers per message.
+        """
+        return not (
+            self.flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        ) and not self.datagram
 
     def _handle(self, base_key: bytes, seq: int, continuous):
-        # Datagram mode: fresh RC4 keyed by MD5(SealingKey || le32(seq)) per
-        # message. Connection-oriented: the persistent continuous handle.
+        # Datagram mode reinitialises the RC4 handle for every message;
+        # connection-oriented keeps the persistent continuous one.
+        #
+        # The per-message MD5(SealingKey || le32(seq)) rekey is applied only
+        # under extended session security. MS-NLMP specifies no rekey for the
+        # other case: §3.4.3 states that message confidentiality exists in
+        # connectionless mode only when extended session security is
+        # configured, so it defines no non-ESS behaviour here to follow.
+        # What a Windows DC does instead, measured, is reinitialise from the
+        # sealing key unchanged, leaving every message restarting the same
+        # keystream at offset zero - which is presumably why the
+        # specification declines to offer the combination.
         if self.datagram:
-            rk = hashlib.md5(base_key + struct.pack("<I", seq)).digest()
-            return ARC4.new(rk).encrypt
+            key = base_key
+            if self.flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+                key = hashlib.md5(key + struct.pack("<I", seq)).digest()
+            return ARC4.new(key).encrypt
         return continuous
 
     def wrap(self, plaintext: bytes) -> bytes:
         handle = self._handle(
             self.client_seal_key, self.send_seq, self.client_seal_handle
         )
-        if self.seal_out:
-            # SEAL's sealingKey parameter is accepted but unused by impacket's
-            # own implementation - encryption comes entirely from `handle` -
-            # so the signing key is passed for both positions.
-            sealed, sig = SEAL(
-                self.flags,
-                self.client_sign_key,
-                self.client_sign_key,
-                plaintext,
-                plaintext,
-                self.send_seq,
-                handle,
+        sealed = handle(plaintext) if self.seal_out else plaintext
+        # MS-NLMP §3.4.2 and §3.4.3 both hand MAC() the same Handle the body
+        # was sealed from, so the signature continues that one keystream.
+        # Datagram mode without extended session security is the exception: a
+        # Windows DC reinitialises there, masking the signature from offset
+        # zero of a handle of its own, and rejects a message signed off the
+        # continuing keystream with "Error decrypting ldap message".
+        mac_handle = handle
+        if self.datagram and not (
+            self.flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        ):
+            mac_handle = self._handle(
+                self.client_seal_key, self.send_seq, self.client_seal_handle
             )
-        else:
-            sig = SIGN(
-                self.flags, self.client_sign_key, plaintext, self.send_seq, handle
-            )
-            sealed = plaintext
+        sig = MAC(
+            self.flags,
+            mac_handle,
+            self.client_sign_key,
+            self.send_seq,
+            plaintext,
+        )
         self.send_seq += 1
+        if self._shares_sequence():
+            self.recv_seq = self.send_seq
         return sig.getData() + sealed
 
     def unwrap(self, wrapped: bytes) -> bytes:
@@ -183,6 +274,21 @@ class NTLMLayerStrategy:
         # payload - the opposite order from RFC 4752's GSS_Wrap convention,
         # which puts the trailing MIC after the payload.
         signature, payload = wrapped[:16], wrapped[16:]
+        # Datagram mode keys each message independently off a sequence
+        # number, so the receiver has to use the one the *sender* used
+        # rather than its own count of messages seen. MS-NLMP §3.4.4 puts
+        # that number in the signature's last 4 bytes (Version(4) ||
+        # Checksum(8) || SeqNum(4)) precisely so it need not be inferred,
+        # and a Windows DC does not increment it for its own replies here:
+        # it stays at 0 while a local counter climbs, so every message
+        # after the first decrypts under the wrong key.
+        #
+        # That reading applies to the extended-session-security signature,
+        # which carries the number in the clear. The legacy signature
+        # (§3.4.4.1) masks the same field with the sealing keystream, and no
+        # number is needed there because the handle does not derive from one.
+        if self.datagram and self.flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+            self.recv_seq = struct.unpack("<I", signature[12:16])[0]
         handle = self._handle(
             self.server_seal_key, self.recv_seq, self.server_seal_handle
         )
@@ -203,18 +309,27 @@ class NTLMLayerStrategy:
             plain = handle(payload)  # RC4 is symmetric: same handle decrypts
         else:
             plain = payload
-        # MS-NLMP §3.4.4: MAC() always runs its 8-byte checksum through the
-        # same RC4 handle, whether or not the body itself was sealed - the
-        # sender did (impacket's SEAL()/SIGN() both consume it), so a receiver
-        # that skips it leaves this handle 8 bytes behind the sender's for
-        # every message. With a single wrapped message per connection that
-        # never surfaces; the moment a second one arrives - a DC bundling
-        # results across frames, say - it decrypts to garbage. Consumed
-        # here rather than verified, keeping signature
-        # checking out of scope while still tracking the keystream correctly.
-        handle(b"\x00" * 8)
+        # MS-NLMP §3.4.4: MAC() runs part of the signature through the same
+        # RC4 handle, whether or not the body itself was sealed, so a
+        # receiver that skips it falls behind the sender's keystream by that
+        # much on every message. With a single wrapped message per
+        # connection that never surfaces; the moment a second one arrives -
+        # a DC bundling results across frames, say - it decrypts to garbage.
+        #
+        # How much differs by regime. With extended session security
+        # (§3.4.4.1) it is the 8-byte HMAC checksum. Without it (§3.4.4.2)
+        # the signature is RandomPad, Checksum and SeqNum, each 4 bytes and
+        # each passed through the handle, for 12. Consumed rather than
+        # verified, keeping signature checking out of scope while still
+        # tracking the keystream correctly.
+        if self.flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+            handle(b"\x00" * 8)
+        else:
+            handle(b"\x00" * 12)
         del signature  # signature verification is out of scope for this tester
         self.recv_seq += 1
+        if self._shares_sequence():
+            self.send_seq = self.recv_seq
         return plain
 
 
@@ -240,6 +355,37 @@ def _looks_like_cleartext_ldap(payload: bytes) -> bool:
     return total + body_len <= len(payload)
 
 
+def _legacy_seal_key(flags: int, exported_session_key: bytes) -> bytes:
+    """SEALKEY's branches for when extended session security is absent
+    (MS-NLMP §3.4.5.3).
+
+    The truncation to 56 or 40 bits applies only when NTLMSSP_NEGOTIATE_LM_KEY
+    or NTLMSSP_NEGOTIATE_DATAGRAM is set; otherwise the sealing key is the
+    ExportedSessionKey unchanged. impacket's SEALKEY truncates whenever
+    extended session security is absent, which yields a key a DC does not
+    agree with for a plain NTLMv1 bind, so this is computed here instead of
+    calling it.
+
+    The specification additionally conditions the DATAGRAM case on
+    NTLMRevisionCurrent >= NTLMSSP_REVISION_W2K3; that is not checked here,
+    since nothing in this tool negotiates datagram mode.
+    """
+    if flags & (NTLMSSP_NEGOTIATE_LM_KEY | NTLMSSP_NEGOTIATE_DATAGRAM):
+        if flags & NTLMSSP_NEGOTIATE_56:
+            return exported_session_key[:7] + b"\xa0"
+        return exported_session_key[:5] + b"\xe5\x38\xb0"
+    return exported_session_key
+
+
+def seal_key(flags: int, exported_session_key: bytes, mode: str) -> bytes:
+    """The sealing key for one direction, by regime. Extended session
+    security derives a distinct key per direction; without it there is a
+    single key shared by both (MS-NLMP §3.4)."""
+    if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+        return SEALKEY(flags, exported_session_key, mode=mode)
+    return _legacy_seal_key(flags, exported_session_key)
+
+
 def build_ntlm_layer_strategy(
     layer: str,
     flags: int,
@@ -249,8 +395,19 @@ def build_ntlm_layer_strategy(
 ) -> NTLMLayerStrategy:
     client_sign_key = SIGNKEY(flags, exported_session_key, mode="Client")
     server_sign_key = SIGNKEY(flags, exported_session_key, mode="Server")
-    client_seal_key = SEALKEY(flags, exported_session_key, mode="Client")
-    server_seal_key = SEALKEY(flags, exported_session_key, mode="Server")
+    client_seal_key = seal_key(flags, exported_session_key, "Client")
+    server_seal_key = seal_key(flags, exported_session_key, "Server")
+
+    # MS-NLMP §3.4: without NTLM v2 "only one key is used for sealing. As a
+    # result, operations are performed in a half-duplex mode" - one RC4
+    # stream carries both directions, advancing across the alternating
+    # request and response. Extended session security has a key per
+    # direction and so a stream per direction.
+    if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+        client_seal_handle = ARC4.new(client_seal_key).encrypt
+        server_seal_handle = ARC4.new(server_seal_key).encrypt
+    else:
+        client_seal_handle = server_seal_handle = ARC4.new(client_seal_key).encrypt
     # Datagram per-message rekey applies only to GSS-wrapped NTLM (GSSAPI /
     # GSS-SPNEGO) sealed without signing - raw Sicily/SASL NTLM keeps the
     # continuous stream for the same flags (see NTLMLayerStrategy).
@@ -279,9 +436,46 @@ def build_ntlm_layer_strategy(
         client_seal_key=client_seal_key,
         server_sign_key=server_sign_key,
         server_seal_key=server_seal_key,
-        client_seal_handle=ARC4.new(client_seal_key).encrypt,
-        server_seal_handle=ARC4.new(server_seal_key).encrypt,
+        client_seal_handle=client_seal_handle,
+        server_seal_handle=server_seal_handle,
     )
+
+
+# MsvAvFlags (MS-NLMP §2.2.2.1) and the bit within it by which a client
+# declares it "is providing message integrity in the MIC field".
+NTLMSSP_AV_FLAGS = 0x0006
+MSV_AV_FLAG_MIC = 0x00000002
+
+
+def declare_mic_in_challenge(type2_bytes: bytes) -> bytes:
+    """Returns the CHALLENGE_MESSAGE with MsvAvFlags bit 0x2 set in its
+    TargetInfo, so that the client's own NTLMv2 blob ends up carrying that
+    declaration.
+
+    MS-NLMP §3.1.5.1.2 requires a client supplying a MIC to say so through
+    that bit, and the blob's AV_PAIR list is where the statement lives.
+    Because the list is covered by NTProofStr, the pair has to be present
+    before the response is computed rather than added afterwards - and
+    impacket's getNTLMSSPType3 offers no hook for that, seeding its AV_PAIRS
+    from the challenge it is handed. Setting it here therefore reaches the
+    same wire bytes a client produces by adding the pair itself.
+
+    Only the copy fed to response construction is modified. The MIC is
+    computed over the messages as they were exchanged, so callers must keep
+    hashing the challenge the server actually sent.
+    """
+    challenge = NTLMAuthChallenge(type2_bytes)
+    av_pairs = AV_PAIRS(challenge["TargetInfoFields"])
+
+    existing = av_pairs[NTLMSSP_AV_FLAGS]
+    value = struct.unpack("<I", existing[1])[0] if existing is not None else 0
+    av_pairs[NTLMSSP_AV_FLAGS] = struct.pack("<I", value | MSV_AV_FLAG_MIC)
+
+    target_info = av_pairs.getData()
+    challenge["TargetInfoFields"] = target_info
+    challenge["TargetInfoFields_len"] = len(target_info)
+    challenge["TargetInfoFields_max_len"] = len(target_info)
+    return challenge.getData()
 
 
 def complete_ntlm_handshake(
@@ -314,9 +508,17 @@ def complete_ntlm_handshake(
     # falsy gives impacket the sentinel it expects.
     lmhash = creds.lmhash if creds.lmhash else ""
     nthash = creds.nthash if creds.nthash else ""
+    # --announce-mic only alters the challenge handed to response construction,
+    # so that the declaration lands inside the blob NTProofStr covers. The
+    # caller still hashes the challenge as received when it computes the MIC.
+    challenge_for_response = (
+        declare_mic_in_challenge(type2_bytes)
+        if creds.announce_mic
+        else type2_bytes
+    )
     type3, exported_session_key = getNTLMSSPType3(
         type1,
-        type2_bytes,
+        challenge_for_response,
         creds.username,
         creds.password,
         creds.domain,
@@ -324,6 +526,7 @@ def complete_ntlm_handshake(
         nthash,
         service="ldap",
         version=version,
+        use_ntlmv2=not creds.ntlmv1,
         # impacket places this in the MsvAvChannelBindings AV_PAIR
         # (NTLMSSP_AV_CHANNEL_BINDINGS, 0x0a) and recomputes NTProofStr over
         # the modified TargetInfo, so passing it here is all that is needed.
@@ -336,4 +539,39 @@ def complete_ntlm_handshake(
         gss_wrapped=gss_wrapped,
         always_seal=creds.ntlm_always_seal,
     )
+    # Recorded from the challenge, which is what impacket's KXKEY consults -
+    # what the Type 1 requested may not be what the server granted.
+    strategy.kxkey = kxkey_branch(
+        NTLMAuthChallenge(type2_bytes)["flags"], creds.ntlmv1
+    )
     return type3, strategy, exported_session_key
+
+
+def finalize_type3(
+    type3,
+    type1: NTLMAuthNegotiate,
+    type2_bytes: bytes,
+    exported_session_key: bytes,
+    creds,
+) -> bytes:
+    """Returns the AUTHENTICATE_MESSAGE bytes to put on the wire, carrying the
+    MIC that creds.mic selects.
+
+    MS-NLMP §3.1.5.1.2 computes the MIC over the concatenated three messages
+    with the field itself zeroed, since the message being hashed is the one
+    that will carry the result.
+
+    Dropping it needs nothing structural here beyond leaving the field unset:
+    the Type 1 then carried no NTLMSSP_NEGOTIATE_VERSION, so impacket reserves
+    no space for either Version or MIC and the payload starts at offset 64.
+    """
+    if creds.mic == "drop":
+        return type3.getData()
+    type3["MIC"] = b"\x00" * 16
+    if creds.mic == "empty":
+        return type3.getData()
+    type3["MIC"] = hmac_md5(
+        exported_session_key,
+        type1.getData() + NTLMAuthChallenge(type2_bytes).getData() + type3.getData(),
+    )
+    return type3.getData()
