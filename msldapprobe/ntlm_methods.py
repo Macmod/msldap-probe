@@ -63,18 +63,13 @@ def _bind_result_code(protocol_op) -> ResultCode:
 def _bind_sicily(
     transport: LDAPTransport, creds: Credentials, layer: str
 ) -> BindOutcome:
-    # Round 1: package discovery (unauthenticated probe, confirms NTLM is offered).
-    discover = BindRequest()
-    discover["version"] = 3
-    discover["name"] = creds.username
-    discover["authentication"]["sicilyPackageDiscovery"] = ""
-    resp = transport.send_bind(discover)
-    if _bind_result_code(resp) != ResultCode("success"):
-        return BindOutcome(
-            False, f"package discovery failed: {bind_failure_detail(resp)}"
-        )
+    # The sicilyPackageDiscovery round (unauthenticated probe asking which
+    # packages the server offers) is skipped: on an already-authenticated
+    # connection AD resets the TCP session when it receives it, and on a
+    # fresh connection it only confirms that NTLM is offered, which is
+    # already known. Going straight to sicilyNegotiate works in both cases.
 
-    # Round 2: negotiate (Type1 with layer-specific flags). The MIC is
+    # Round 1: negotiate (Type1 with layer-specific flags). The MIC is
     # supplied here as it is in the other two families: MS-NLMP §3.1.5.1.2
     # conditions it on the CHALLENGE_MESSAGE carrying MsvAvTimestamp, which
     # is a property of the mechanism rather than of the carrier that

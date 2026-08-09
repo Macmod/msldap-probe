@@ -254,12 +254,13 @@ FAIL/PARTIAL details are hidden unless `--debug` is used, to keep the default ou
 
 ## Implementation notes
 
-- Built on top of `impacket`'s `LDAPConnection`, but replaces its built-in `login()` / `kerberosLogin()` paths to gain independent control over signing and sealing flags.
-- `--scheme` applies uniformly to every method; the security layer (if any) is negotiated on top of that transport.
-- Per-message wrap/unwrap is implemented separately per family, in `msldapprobe/ntlm_layers.py`, `msldapprobe/krb_layers.py` and `msldapprobe/digest_md5_methods.py`.
-- The receive path reads one SASL frame at a time and coalesces frames until a response is complete, so a reply spanning several frames is handled. It also accepts an unwrapped `LDAPMessage` mid-connection, which is how a DC delivers a Notice of Disconnection while tearing a session down - that server-side explanation is surfaced verbatim instead of appearing as a connection reset.
-- Kerberos methods require a resolvable SPN. If `--target` is an IP, use `--spn-host` to supply the real hostname for `ldap/<spn-host>`.
-- `sasl_external` does not require credentials; it reports what the server does when an EXTERNAL bind is attempted with or without a TLS client certificate.
+* Built on top of `impacket`'s `LDAPConnection`, but replaces its built-in `login()` / `kerberosLogin()` paths to gain independent control over signing and sealing flags.
+* `--scheme` applies uniformly to every method; the security layer (if any) is negotiated on top of that transport.
+* Kerberos methods require a resolvable SPN. If `--target` is an IP, use `--spn-host` to supply the real hostname for `ldap/<spn-host>`.
+* `sasl_external` does not require credentials; it reports what the server does when an EXTERNAL bind is attempted with or without a TLS client certificate.
+* For some reason a Sicily-style rebind after a SASL layer has been established **does not seem to work** and the connection is reset. I could not figure out why.
+* Impacket still includes some old Python2 code that raises exceptions in Python3 regarding the NTLMv1 LM path - which is not a big problem, as supporting LM paths is a bit overkill even for this project's goals.
+* The receive path reads one SASL frame at a time and coalesces frames until a response is complete, so a reply spanning several frames is handled. It also accepts an unwrapped `LDAPMessage` mid-connection, which is how a DC delivers a Notice of Disconnection while tearing a session down - that server-side explanation is surfaced verbatim instead of appearing as a connection reset.
 
 ## License
 
