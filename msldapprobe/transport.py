@@ -17,19 +17,31 @@ from typing import Optional
 from pyasn1.codec.ber import decoder, encoder
 from pyasn1.error import SubstrateUnderrunError
 
-from impacket.ldap.ldap import LDAPConnection, LDAPSearchError, LDAPSessionError
+from impacket.ldap.ldap import (
+    LDAPConnection,
+    LDAPFilterInvalidException,
+    LDAPSearchError,
+    LDAPSessionError,
+)
 from impacket.ldap.ldapasn1 import (
     BindRequest,
+    DerefAliases,
     ExtendedRequest,
     LDAPMessage,
     ResultCode,
     Scope,
+    SearchRequest,
+    SearchResultDone,
 )
 
 from .layers import LayerStrategy
 
 # RFC 4511 §4.14 / [MS-ADTS] LDAP_SERVER_START_TLS_OID.
 _START_TLS_OID = "1.3.6.1.4.1.1466.20037"
+
+# RFC 4532 "Who am I?", which reports the authorization identity the server
+# associates with the connection.
+_WHOAMI_OID = "1.3.6.1.4.1.4203.1.11.3"
 
 
 class LDAPTransport(LDAPConnection):
@@ -94,13 +106,48 @@ class LDAPTransport(LDAPConnection):
         plaintext ldap:// connection, then upgrades the socket."""
         ext_req = ExtendedRequest()
         ext_req["requestName"] = _START_TLS_OID
-        resp = self.sendReceive(ext_req)[0]["protocolOp"]["extendedResp"]
+        replies = self.sendReceive(ext_req)
+        if not replies:
+            # Nothing came back as LDAP: the peer closed the connection, or it
+            # speaks TLS from the first byte on this port and is waiting for a
+            # ClientHello rather than an extended operation.
+            raise LDAPSessionError(
+                errorString=(
+                    "no response to StartTLS - the peer closed the connection or "
+                    "does not speak plaintext LDAP on this port"
+                )
+            )
+        resp = replies[0]["protocolOp"]["extendedResp"]
         if resp["resultCode"] != ResultCode("success"):
             raise LDAPSessionError(
                 error=int(resp["resultCode"]),
                 errorString=f"StartTLS failed: {resp['resultCode'].prettyPrint()}",
             )
         self.upgrade_tls(cert_pem, key_pem)
+
+    def whoami(self) -> str:
+        """RFC 4532 whoami: returns the authorization identity the server
+        associates with this connection (e.g. "u:CRETA\\joao_couves"), or ""
+        when it associates none. Usable at any point in a session, before or
+        after a bind, since the answer is a property of the connection rather
+        than of any one operation."""
+        ext_req = ExtendedRequest()
+        ext_req["requestName"] = _WHOAMI_OID
+        replies = self.sendReceive(ext_req)
+        if not replies:
+            raise LDAPSessionError(
+                errorString="no response to the whoami extended operation"
+            )
+        resp = replies[0]["protocolOp"]["extendedResp"]
+        if resp["resultCode"] != ResultCode("success"):
+            raise LDAPSessionError(
+                error=int(resp["resultCode"]),
+                errorString=f"whoami failed: {resp['resultCode'].prettyPrint()}",
+            )
+        value = resp["responseValue"]
+        if not value.isValue:
+            return ""
+        return value.asOctets().decode("utf-8", "replace").rstrip("\x00")
 
     def send(self, request, controls=None) -> None:
         """Overrides the base class's send(), which assigns each message a
@@ -371,6 +418,98 @@ class LDAPTransport(LDAPConnection):
         strategy is active yet regardless of what the constructor's
         signing= was)."""
         return self.sendReceive(bind_request)[0]["protocolOp"]
+
+    def search(
+        self,
+        searchBase=None,
+        scope=None,
+        derefAliases=None,
+        sizeLimit=0,
+        timeLimit=0,
+        typesOnly=False,
+        searchFilter="(objectClass=*)",
+        attributes=None,
+        searchControls=None,
+        perRecordCallback=None,
+    ):
+        """Overrides the base class's search(), which sends the SearchRequest
+        once per iteration of its read loop rather than once per page:
+
+            while not done:
+                response = self.sendReceive(searchRequest, searchControls)
+
+        `sendReceive` sends *and* receives, so a result set delivered across
+        more than one read costs an extra, unsolicited SearchRequest per read.
+        That is invisible against a server that puts the SearchResultEntry and
+        its SearchResultDone in one read - which Active Directory does - and
+        surfaces against anything that delivers them separately, such as a
+        proxy that re-encodes and forwards messages individually. The stray
+        request's own responses then arrive behind whatever is sent next, so
+        the following operation reads a SearchResultEntry where it expects its
+        own reply, and the connection is desynchronised from there on.
+
+        Sending once per page keeps genuine paged searches intact, where a
+        further request carrying the cookie _handleControls() updates is
+        exactly right, while a single-page result costs one request.
+        """
+        if not isinstance(searchFilter, str):
+            raise LDAPFilterInvalidException(
+                "searchFilter must be %s, got %s" % (str, type(searchFilter))
+            )
+        if searchBase is None:
+            searchBase = self._baseDN
+        if scope is None:
+            scope = Scope("wholeSubtree")
+        if derefAliases is None:
+            derefAliases = DerefAliases("neverDerefAliases")
+        if attributes is None:
+            attributes = []
+
+        searchRequest = SearchRequest()
+        searchRequest["baseObject"] = searchBase
+        searchRequest["scope"] = scope
+        searchRequest["derefAliases"] = derefAliases
+        searchRequest["sizeLimit"] = sizeLimit
+        searchRequest["timeLimit"] = timeLimit
+        searchRequest["typesOnly"] = typesOnly
+        searchRequest["filter"] = self._parseFilter(searchFilter)
+        searchRequest["attributes"].setComponents(*attributes)
+
+        answers = []
+        done = False
+        while not done:
+            self.send(searchRequest, searchControls)
+            page_done = False
+            while not page_done:
+                messages = self.recv()
+                if not messages:
+                    # The peer closed the connection before the searchResDone
+                    # that ends this page. Nothing further can arrive, and the
+                    # send that would have failed is outside this loop.
+                    raise LDAPSessionError(
+                        errorString="connection closed during search"
+                    )
+                for message in messages:
+                    searchResult = message["protocolOp"].getComponent()
+                    if not searchResult.isSameTypeWith(SearchResultDone()):
+                        if perRecordCallback is None:
+                            answers.append(searchResult)
+                        else:
+                            perRecordCallback(searchResult)
+                        continue
+                    page_done = True
+                    if searchResult["resultCode"] != ResultCode("success"):
+                        raise LDAPSearchError(
+                            error=int(searchResult["resultCode"]),
+                            errorString="Error in searchRequest -> %s: %s"
+                            % (
+                                searchResult["resultCode"].prettyPrint(),
+                                searchResult["diagnosticMessage"],
+                            ),
+                            answers=answers,
+                        )
+                    done = self._handleControls(searchControls, message["controls"])
+        return answers
 
     def verify_rootdse_namingcontexts(self) -> tuple[bool, str]:
         """Post-bind proof step: a base-scope search for namingContexts on

@@ -29,7 +29,7 @@ Methods are registered in `msldapprobe/methods.py` and grouped by mechanism fami
 
 | Family | Names |
 |--------|-------|
-| Simple (anonymous) / Simple (with creds) | `anonymous_bind`, `simple_bind` |
+| Simple (anonymous) / Simple (with creds) / No bind | `anonymous_bind`, `simple_bind`, `no_bind` |
 | Sicily (NTLM) | `sicily_ntlm_plain`, `sicily_ntlm_signonly`, `sicily_ntlm_sealonly`, `sicily_ntlm_signseal` |
 | SASL/GSS-SPNEGO (NTLM) | `sasl_spnego_ntlm_plain`, `sasl_spnego_ntlm_signonly`, `sasl_spnego_ntlm_sealonly`, `sasl_spnego_ntlm_signseal` |
 | SASL/GSSAPI (NTLM) | `sasl_gssapi_ntlm_plain`, `sasl_gssapi_ntlm_signonly`, `sasl_gssapi_ntlm_sealonly`, `sasl_gssapi_ntlm_signseal` |
