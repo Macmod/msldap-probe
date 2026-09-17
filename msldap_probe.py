@@ -67,9 +67,9 @@ def _hint(name: str, detail: str) -> str:
         # RFC 2831 has no field for a channel binding, so --channel-bindings
         # cannot help here - the method simply cannot satisfy a DC that
         # requires one.
-        note = " (bad bindings, DIGEST-MD5 cannot carry one)"
+        note = " (bad bindings - DIGEST-MD5 cannot carry one)"
     else:
-        note = " (bad bindings, retry with --channel-bindings)"
+        note = " (bad bindings)"
     return _paint(note, "yellow", _COLOR)
 
 
