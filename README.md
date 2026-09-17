@@ -42,24 +42,57 @@ Each NTLM family tests four security layers: plain, sign-only, seal-only, and si
 
 ### About Kerberos
 
+**Subkeys & etypes**
+
 For Kerberos methods, the AP-REQ subkey etype proposal is controlled by `--propose-subkey` (see below) rather than provided in separate method variants. The subkey governs per-message protection per RFC 4121 §2: `aes256-cts-hmac-sha1-96` (default) steers the DC toward an AES256 acceptor subkey; `none` lets the DC pick from its `msDS-SupportedEncryptionTypes` (typically RC4-HMAC on a default-configured DC); `rc4-hmac` and `aes128-cts-hmac-sha1-96` propose those etypes explicitly.
+
+**Automatic ticket requests**
+
+When no Kerberos-specific credential (`--ccache` or `--aes-key`) is supplied but Kerberos methods are selected and a **password** or **NT hash** is present, a TGT and a ST are obtained in memory from that credential.
+
+**Mutual authentication**
+
+`--mutual-auth` decides whether the Kerberos AP-REQ sets the `mutual-required` ap-options bit (RFC 4120 §5.5.1), which asks the server to prove itself with an AP-REP. Both carriers require it by default, which is what a real client sends; the AP-REP's acceptor subkey then governs per-message protection on either one, and `--propose-subkey` steers the etype the DC picks for it.
+
+For a SASL/GSSAPI bind it also decides the shape of the exchange, because the AP-REP is a second context token and SASL strictly alternates challenge and response. With mutual authentication it is six messages: AP-REQ, AP-REP, an **empty** client response (the context is complete and `GSS_Init_sec_context` has no output token left, but the client still owes a turn), the server's wrapped security-layer offer, the client's wrapped reply, success. RFC 4752 §3.2 has a server that produced no output token send its §3.3 offer straight away, which would make the bind four messages - but a DC does not: it answers an **empty challenge** where the AP-REP would have been and keeps the six-message shape. Both are accepted here.
+
+RFC 4752 §3.1 only mandates mutual authentication when the client will be requesting a security layer - integrity is the unconditional requirement there - so `none` is within spec for `plain` and a deliberate deviation for `signonly`/`signseal`. A DC accepts it in all three: the security-layer offer still comes back as `0x07` (all three layers, 10 MiB buffer), and post-bind signing and sealing work, keyed with the subkey the AP-REQ proposed since no acceptor subkey was ever issued.
+
+On GSS-SPNEGO the AP-REP arrives inside the `negTokenResp`, which is what a Windows/SSPI client gets. SPNEGO needs no extra round for it - the AP-REP rides on the same reply that carries `accept-completed` - so the bind stays a single round trip either way, and `--mutual-auth none` only costs it the server authentication and moves the per-message key back to the proposed subkey.
+
+A DC also checks the two mutual signals against each other. Mutual authentication is requested twice in an AP-REQ: the `mutual-required` ap-options bit, and `GSS_C_MUTUAL_FLAG` (0x02) in the authenticator's GSS-API checksum (RFC 4121 §4.1.1.1). Setting the checksum bit with `--cksum-flags` while `--mutual-auth none` clears the ap-options bit is refused with `invalidCredentials` and no `serverSaslCreds` at all; the reverse asymmetry - ap-options set, checksum bit absent, which is what this tool sends by default - is accepted.
+
+**Optimistic vs deferred mechToken (SPNEGO)**
+
+A SPNEGO NegTokenInit carries two separate things: `mechTypes`, the list of mechanism OIDs the client supports, and `mechToken`, the first context token of the first one - the *optimistic* token of RFC 4178 §4.2.1, sent on the guess that the server will pick that mechanism. `--spnego-mech-token deferred` omits it and sends the AP-REQ in the next round's `responseToken` instead.
+
+Against a DC that is the difference between one round trip and three:
+
+| | `optimistic` | `deferred` |
+|---|---|---|
+| 1 | `NegTokenInit{mechTypes, mechToken=AP-REQ}` → `success` + `AP-REP` | `NegTokenInit{mechTypes}` → `accept-incomplete`, `supportedMech=Kerberos` |
+| 2 | | `NegTokenResp{responseToken=AP-REQ}` → `AP-REP` |
+| 3 | | `NegTokenResp{}` (empty) → `success` |
+
+The third round exists for the same reason bare SASL/GSSAPI has one: the AP-REP is a server token and SASL alternates strictly, so the client has to return the turn before the server can conclude.
+
+**PKINIT**
 
 PKINIT is not implemented as it's more related to the KDC than to the LDAP service itself. To test flows related to PKINIT first perform PKINIT manually to obtain a TGT, then test Kerberos-related methods by providing it via `--ccache` or the KRB5CCNAME environment variable.
 
-> [!NOTE]
-> When no Kerberos-specific credential (`--ccache` or `--aes-key`) is supplied but Kerberos methods are selected and a **password** or **NT hash** is present, a TGT and a ST are obtained in memory from that credential.
+### About NTLM
 
-### About GSSAPI and NTLM
+**NTLM carried by SASL/GSSAPI**
 
 For some reason all Microsoft specs (such as `MS-ADTS`) state that their implementation of the SASL/GSSAPI mech (without SPNEGO) is for Kerberos only (which would seem correct per RFC4752), but Microsoft's own clients such as ADExplorer often issue SASL/GSSAPI carrying NTLM, and DCs accept it just fine.
 
-### About NTLM "signonly"
+**NTLM "signonly"**
 
 A DC accepts a `NTLMSSP_NEGOTIATE_SIGN`-without-`SEAL` bind, but still expects every post-bind body to be **sealed**. Send it a signed cleartext body - which is what MS-NLMP §3.4.3 describes - and it answers with an unsolicited Notice of Disconnection carrying `Error decrypting ldap message`, then hangs up.
 
 By default this tool sends what the negotiated flags actually describe, so the wire matches the method name. Against a DC that means every `*_ntlm_signonly` method reports `PARTIAL`, with the server's own explanation as the detail. Pass `--ntlm-always-seal` to seal the sign-only case too, which is what a DC requires and what makes those methods `PASS`.
 
-### About NTLMv1
+**NTLMv1**
 
 `--ntlmv1` computes an NTLMv1 response instead of NTLMv2, for targets whose LAN Manager authentication level still permits it.
 
@@ -71,19 +104,21 @@ Under `--no-ess`, `sasl_gssapi_ntlm_sealonly` and `sasl_spnego_ntlm_sealonly` re
 
 The legacy regime also shares one sequence number between the two directions, as it shares the sealing key: a reply advances the number the next request carries. Extended session security numbers each direction separately.
 
-### About the MIC
+**Message Integrity Code (MIC)**
 
 `--mic` selects what the Type 3 MIC field carries: `computed` (the default), `empty` for a field present but all zero, or `drop` for no field at all. `--announce-mic` is separate and decides only whether a populated field is *declared*.
 
-**Presence is tied to the Version field.** MS-NLMP §2.2.1.3 lays the `AUTHENTICATE_MESSAGE` out as a fixed 64-byte header, then Version, then MIC, then the payload, and gives neither Version nor MIC a presence flag of its own. A receiver takes both to be present exactly when `NTLMSSP_NEGOTIATE_VERSION` is set, so it seems the two have to be emitted or omitted together - which is why `drop` also drops Version and that flag. 
+*Presence is tied to the Version field.* MS-NLMP §2.2.1.3 lays the `AUTHENTICATE_MESSAGE` out as a fixed 64-byte header, then Version, then MIC, then the payload, and gives neither Version nor MIC a presence flag of its own. A receiver takes both to be present exactly when `NTLMSSP_NEGOTIATE_VERSION` is set, so it seems the two have to be emitted or omitted together - which is why `drop` also drops Version and that flag. 
 
-**An undeclared MIC is not checked.** `computed` and `empty` are both accepted, so by default the field is structural only and provides no integrity protection. `--announce-mic` declares it through `MsvAvFlags` bit 0x2, which MS-NLMP §3.1.5.1.2 requires of a client supplying one. The declaration lands in the NTLMv2 blob before `NTProofStr` covers it, so the MIC becomes one the server is told to check - and then the value matters. On its own, `--announce-mic` declares the computed MIC and a DC accepts it. `--mic empty --announce-mic` declares a field left all zero, and a DC rejects it with `data 57` - which is what shows the value is genuinely verified once declared, rather than merely required to be present.
+*An undeclared MIC is not checked.* `computed` and `empty` are both accepted, so by default the field is structural only and provides no integrity protection. `--announce-mic` declares it through `MsvAvFlags` bit 0x2, which MS-NLMP §3.1.5.1.2 requires of a client supplying one. The declaration lands in the NTLMv2 blob before `NTProofStr` covers it, so the MIC becomes one the server is told to check - and then the value matters. On its own, `--announce-mic` declares the computed MIC and a DC accepts it. `--mic empty --announce-mic` declares a field left all zero, and a DC rejects it with `data 57` - which is what shows the value is genuinely verified once declared, rather than merely required to be present.
 
 A declared MIC is only validated when `NTLMSSP_NEGOTIATE_ALWAYS_SIGN` was negotiated. Without it a DC answers `data 57` however correct the MIC is, and neither the key exchange nor the security layer makes any difference. Every method here negotiates that flag, including the `*_ntlm_plain` ones: MS-NLMP §2.2.2.5 has it request a signature block without negotiating session security, which is why it does not turn `plain` into a signed method - a Windows client sets it in every `NEGOTIATE_MESSAGE` regardless of the layer it goes on to use.
 
-**A declaration with no field behind it is refused.** `--mic drop --announce-mic` sends a blob declaring a MIC in a message that carries none, and a DC rejects all twelve methods with `data 57`; `--mic drop` on its own passes all twelve, so the declaration bit is the only difference and the DC is enforcing presence rather than reacting to the missing field. That pairing is not merely a misconfiguration: `MsvAvFlags` lives inside the blob that `NTProofStr` covers, so a declaration cannot be withdrawn once the response is computed, and stripping the MIC field while the declaration stands is reachable without the client's cooperation. A server that accepted it would be honouring a declaration it never checked.
+*A declaration with no field behind it is refused.* `--mic drop --announce-mic` sends a blob declaring a MIC in a message that carries none, and a DC rejects all twelve methods with `data 57`; `--mic drop` on its own passes all twelve, so the declaration bit is the only difference and the DC is enforcing presence rather than reacting to the missing field. That pairing is not merely a misconfiguration: `MsvAvFlags` lives inside the blob that `NTProofStr` covers, so a declaration cannot be withdrawn once the response is computed, and stripping the MIC field while the declaration stands is reachable without the client's cooperation. A server that accepted it would be honouring a declaration it never checked.
 
-### About channel bindings
+### About TLS
+
+**Channel bindings**
 
 `--channel-bindings` makes NTLM and Kerberos SASL binds carry an RFC 5929 `tls-server-end-point` token, tying the authentication to the TLS certificate the connection runs on. It is what a DC with `LdapEnforceChannelBinding=1` validates and what one set to `2` requires. It only does anything under `-s ldaps` or `-s starttls` - on a plaintext connection there is no channel to bind, so the token is omitted and the flag is a no-op.
 
@@ -96,6 +131,14 @@ python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -m 
 Against a DC set to `2`, omitting the flag fails every method with `data 80090346` (`SEC_E_BAD_BINDINGS`), which is reported as `invalidCredentials` even though the credentials were fine - so the output appends a short hint saying so. Adding the flag makes the NTLM and Kerberos methods pass.
 
 `sasl_digest_md5_plain` fails either way, and cannot be made to pass: RFC 2831 predates channel bindings and has no field to carry one, so DIGEST-MD5 is unusable over TLS against a DC that requires them. Simple binds and SASL EXTERNAL are unaffected - neither is a SASL mechanism that carries a binding.
+
+**"Pass the cert"**
+
+The technique informally known as "pass the cert" can apparently flow through the wire in the following "settings" only:
+
+1) StartTLS with the client certificate used during the handshake over a plain LDAP port, then a SASL/EXTERNAL bind (`-s starttls -m sasl_external --cert-pem <certfile> --key-pem <keyfile>`)
+
+2) LDAPS with the client certificate used during the handshake to the secure LDAP port, *without a SASL/EXTERNAL* bind (`-s ldaps -m no_bind --cert-pem <certfile> --key-pem <keyfile>`)
 
 ### About DIGEST-MD5 ciphers
 
@@ -214,6 +257,8 @@ python msldap_probe.py -t dc.creta.local -d creta.local -u alice -p password -s 
 - `-S`, `--spn-host` - real hostname for the `ldap/<host>` SPN when `--target` is an IP.
 - `--propose-subkey` - AP-REQ subkey etype: `none` (DC picks), `rc4-hmac`, `aes128-cts-hmac-sha1-96`, or `aes256-cts-hmac-sha1-96` (default).
 - `--cksum-flags` - override the AP-REQ GSS-API checksum flags (int bitmask of `GSS_C_INTEG_FLAG` 0x20 and `GSS_C_CONF_FLAG` 0x10, RFC 4121 §4.1.1.1). Default: 0x03 for GSSAPI, derived from the bind's layer for SPNEGO.
+- `--mutual-auth` - `required` (default, both Kerberos carriers) or `none` for the AP-REQ's `mutual-required` ap-options bit (RFC 4120 §5.5.1). `none` drops the AP-REP, moving per-message protection onto the proposed subkey (see [About mutual authentication](#about-mutual-authentication)).
+- `--spnego-mech-token` - `optimistic` (default) or `deferred` for the AP-REQ's placement in a `sasl_spnego_krb_*` bind: the NegTokenInit's optimistic mechToken, or a later round's responseToken (see [About the optimistic mechToken](#about-the-optimistic-mechtoken)).
 
 **SASL behaviour**
 

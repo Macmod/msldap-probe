@@ -168,13 +168,39 @@ def parse_gss_token(token_bytes: bytes) -> tuple[bytes, bytes]:
     return mech.data[:2], mech.data[2:]
 
 
+def split_krb_token(token_bytes: bytes) -> tuple[bytes, bytes]:
+    """TOK_ID plus the message after it, from either framing: the
+    [APPLICATION 0]+OID Initial Context Token (RFC 2743 §3.1) that carries
+    context-establishment tokens, or the bare TOK_ID-prefixed form SPNEGO
+    carries in a responseToken and RFC 2743 §3.2 uses for per-message
+    tokens."""
+    try:
+        return parse_gss_token(token_bytes)
+    except Exception:
+        return token_bytes[:2], token_bytes[2:]
+
+
+def classify_server_token(token_bytes: bytes) -> str:
+    """Names what a server put in serverSaslCreds from its TOK_ID: "ap-rep"
+    for the mutual-authentication reply (RFC 1964 §1), "wrap" for a GSS Wrap
+    token - the RFC 4752 §3.3 security-layer offer, CFX (RFC 4121 §4.2) or
+    RC4 (RFC 4757 §7.3) - or "unknown"."""
+    tok_id, _ = split_krb_token(token_bytes)
+    if tok_id == KRB5_AP_REP:
+        return "ap-rep"
+    if tok_id in (b"\x05\x04", b"\x02\x01"):
+        return "wrap"
+    return "unknown"
+
+
 def decrypt_ap_rep(ap_rep_token: bytes, cipher, session_key):
-    """Verifies the mutual-auth response required by RFC 4752 §3.1 for bare
-    SASL/GSSAPI, and returns the key to use for the rest of the exchange:
-    the AP-REP's own subkey (RFC 4120 §5.5.2 - the acceptor may supply one
-    to move off the ticket session key) if present, otherwise the ticket
-    session key unchanged."""
-    tok_id, ap_rep_bytes = parse_gss_token(ap_rep_token)
+    """Verifies the mutual-authentication response a server returns when the
+    AP-REQ asked for it, and returns the key to use for the rest of the
+    exchange: the AP-REP's own subkey (RFC 4120 §5.5.2 - the acceptor may
+    supply one to move off the ticket session key) if present, otherwise the
+    ticket session key unchanged. Accepts both framings, since SPNEGO carries
+    the AP-REP bare in a responseToken while bare GSSAPI frames it."""
+    tok_id, ap_rep_bytes = split_krb_token(ap_rep_token)
     if tok_id != KRB5_AP_REP:
         raise ValueError(
             f"expected AP-REP token (TOK_ID {KRB5_AP_REP.hex()}), got {tok_id.hex()}"
@@ -342,9 +368,14 @@ def build_ap_req(
     mutual_required: bool = False,
     propose_subkey: str = "aes256-cts-hmac-sha1-96",
 ) -> tuple[bytes, Key | None]:
-    """mutual_required must be True for bare SASL/GSSAPI (RFC 4752 §3.1:
-    "the client MUST set the mutual_state flag to TRUE") - the GSSAPI SASL
-    mechanism always uses mutual authentication, unlike SPNEGO's Kerberos."""
+    """mutual_required sets the AP-REQ's "mutual-required" ap-options bit
+    (RFC 4120 §5.5.1), asking the server to answer with an AP-REP. RFC 4752
+    §3.1 makes it mandatory for bare SASL/GSSAPI only when the client will be
+    requesting a security layer ("If the client will be requesting a security
+    layer, it MUST also supply to the GSS_Init_sec_context a mutual_req_flag
+    of TRUE"); integrity is the unconditional MUST there. Without it the
+    server returns no AP-REP, so the per-message key stays the subkey this
+    function proposes (or the ticket session key when none is proposed)."""
     ap_req = AP_REQ()
     ap_req["pvno"] = 5
     ap_req["msg-type"] = int(constants.ApplicationTagNumbers.AP_REQ.value)

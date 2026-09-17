@@ -149,6 +149,31 @@ def parse_args() -> argparse.Namespace:
         "bind's own layer). Ignored by non-Kerberos methods.",
     )
     p.add_argument(
+        "--mutual-auth",
+        default=None,
+        choices=["required", "none"],
+        help="Whether the Kerberos AP-REQ asks for mutual authentication "
+        "(the 'mutual-required' ap-options bit, RFC 4120 §5.5.1), making the "
+        "server prove itself with an AP-REP. Both Kerberos carriers require it "
+        "by default, as a real client does. RFC 4752 §3.1 only "
+        "mandates mutual authentication for bare SASL/GSSAPI when the client "
+        "requests a security layer, and without an AP-REP the per-message key "
+        "stays the subkey the AP-REQ proposed; both the four-message shape "
+        "RFC 4752 §3.2 describes and the empty challenge AD sends in place of "
+        "the AP-REP are accepted. Ignored by non-Kerberos methods.",
+    )
+    p.add_argument(
+        "--spnego-mech-token",
+        default="optimistic",
+        choices=["optimistic", "deferred"],
+        help="Whether a GSS-SPNEGO Kerberos bind carries the AP-REQ as the "
+        "NegTokenInit's optimistic mechToken (RFC 4178 §4.2.1), the default, or "
+        "defers it: 'deferred' sends mechTypes alone, waits for the server to "
+        "name the selected mechanism, and only then sends the AP-REQ in a "
+        "responseToken - the rounds a negotiation costs when the initiator does "
+        "not guess. Ignored by every method except sasl_spnego_krb_*.",
+    )
+    p.add_argument(
         "--digest-md5-cipher",
         default="rc4",
         choices=["rc4", "rc4-56", "rc4-40", "des", "3des"],
@@ -306,6 +331,8 @@ def build_credentials(args: argparse.Namespace) -> Credentials:
         spn_host=args.spn_host,
         propose_subkey=args.propose_subkey,
         cksum_flags=args.cksum_flags,
+        mutual_auth=args.mutual_auth,
+        spnego_mech_token=args.spnego_mech_token,
         ntlm_always_seal=args.ntlm_always_seal,
         ntlmv1=args.ntlmv1,
         no_ess=args.no_ess,

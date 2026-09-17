@@ -59,6 +59,26 @@ class Credentials:
     # (GSSAPI: 0x03, SPNEGO: derived from the bind's own layer). Ignored by
     # non-Kerberos methods.
     cksum_flags: int | None = None
+    # Whether the Kerberos AP-REQ sets the "mutual-required" ap-options bit
+    # (RFC 4120 §5.5.1), making the server answer with an AP-REP. Both
+    # Kerberos carriers set it unless this is "none", matching what a real
+    # client sends; the AP-REP's acceptor subkey then governs per-message
+    # protection on either carrier.
+    # RFC 4752 §3.1 only mandates mutual authentication for bare SASL/GSSAPI
+    # when the client requests a security layer. With "none" no AP-REP comes
+    # back, so the per-message key stays the subkey the AP-REQ proposed (or
+    # the ticket session key), and the server either sends its RFC 4752 §3.3
+    # security-layer offer straight away (§3.2's four-message shape) or, as AD
+    # does, an empty challenge in place of the AP-REP. Ignored by non-Kerberos
+    # methods.
+    mutual_auth: str | None = None
+    # Whether a GSS-SPNEGO Kerberos bind puts the AP-REQ in the NegTokenInit's
+    # optimistic mechToken (RFC 4178 §4.2.1) - "optimistic", the default, which
+    # settles the mechanism and its first token in one message - or "deferred",
+    # which sends mechTypes alone and moves the AP-REQ into the next round's
+    # responseToken, the cost of a negotiation the initiator did not shortcut.
+    # Ignored by every method except sasl_spnego_krb_*.
+    spnego_mech_token: str = "optimistic"
     # Whether an NTLM layer that negotiated SIGN without SEAL should
     # nonetheless encrypt what it sends. False (default) puts on the wire
     # exactly what the negotiated flags describe, so sign-only really is
@@ -210,30 +230,19 @@ def _bind_simple_authenticated(
     return _bind_simple(transport, name, creds.password)
 
 
-def _connect_external(creds: Credentials) -> LDAPTransport:
-    """SASL EXTERNAL connect: when a client cert is provided and --scheme
-    is ldaps or starttls, forces StartTLS — AD only binds the TLS client
-    cert identity to EXTERNAL when the TLS handshake happened in response
-    to StartTLS (MS-ADTS: "The presence of the 'EXTERNAL' string value in
-    the supportedSASLMechanisms attribute indicates that the DC accepts
-    external security mechanisms for LDAP bind requests… the external
-    authentication information … comes from the client certificate
-    presented by the client during the SSL/TLS handshake that occurs in
-    response to the client sending an LDAP_SERVER_START_TLS_OID extended
-    operation"), not when TLS was established implicitly via LDAPS.
-    An explicit --scheme ldap (no TLS) is left alone — it's a legitimate
-    test that shows what a server does with EXTERNAL when no TLS session
-    is available to carry an identity."""
-    if creds.cert_pem and creds.key_pem and creds.scheme != "ldap":
-        return open_transport(
-            creds.target,
-            creds.port,
-            "starttls",
-            signing=False,
-            cert_pem=creds.cert_pem,
-            key_pem=creds.key_pem,
-        )
-    return _connect_plain(creds)
+def _bind_none(transport: LDAPTransport, _creds: Credentials) -> BindOutcome:
+    """Sends no BindRequest at all, so the connection carries whatever identity
+    the transport established by itself - the client certificate presented in a
+    TLS handshake, which [MS-ADTS] 5.1.1.1.2 has the DC map to an account under
+    implicit TLS without any LDAP-level authentication.
+
+    RFC 4532 whoami is the proof: it names the identity the server associates
+    with the connection, which is the only way to tell an authenticated TLS
+    session from an anonymous one, since AD answers a rootDSE read either way."""
+    authzid = transport.whoami()
+    if authzid:
+        return BindOutcome(True, f"no bind sent; whoami reports {authzid}")
+    return BindOutcome(False, "no bind sent; whoami reports no identity")
 
 
 def _bind_external(transport: LDAPTransport, creds: Credentials) -> BindOutcome:
@@ -270,12 +279,19 @@ register(
 # shows what a target does with an EXTERNAL bind and no client identity,
 # rather than silently skipping.
 #
-# connect=_connect_external: uses StartTLS when a client cert is provided
-# and --scheme != ldap (ldaps and starttls both go through StartTLS),
-# because AD only binds the TLS client cert identity to EXTERNAL when the
-# TLS handshake happened in response to StartTLS, not under implicit LDAPS
-# TLS.  When --scheme is ldap or no cert is provided, falls through to
-# _connect_plain which honours --scheme as-is.
+# connect=_connect_plain: --scheme is honoured as given, so every transport
+# is a cell of the matrix in its own right. Per MS-ADTS 5.1.1.1.2 the
+# external authentication information comes from the client certificate
+# presented during the TLS handshake that a StartTLS extended operation
+# triggers, so --scheme starttls is the combination AD authenticates;
+# --scheme ldaps and --scheme ldap report what it answers for the others.
 register(
-    Method("sasl_external", requires=[], connect=_connect_external, bind=_bind_external)
+    Method("sasl_external", requires=[], connect=_connect_plain, bind=_bind_external)
 )
+
+# No requires and no bind step: this measures what the transport alone
+# authenticates. Under --scheme ldaps with --cert-pem/--key-pem the certificate
+# is presented in the initial handshake, which is the shape AD maps to an
+# account; under --scheme starttls or ldap the connection stays anonymous until
+# something binds, which this method then reports as such.
+register(Method("no_bind", requires=[], connect=_connect_plain, bind=_bind_none))
